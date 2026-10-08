@@ -286,14 +286,62 @@
   }
   .win-sub{ text-align:center; font-size:15px; color:var(--cyan); letter-spacing:1px; margin-bottom:18px; }
 
-  .ab-label{
-    font-size:12px; color:var(--cyan); letter-spacing:1.5px; margin:14px 0 6px; text-transform:uppercase;
-    display:flex; justify-content:space-between; align-items:baseline;
+  /* ---------- A/B MONITOR (waveform + before/after) ---------- */
+  .abw{
+    border:3px solid var(--wall-light); background:#000; margin:0 0 18px;
+    box-shadow:0 0 18px rgba(33,33,255,0.45), inset 0 0 14px rgba(33,33,255,0.2);
   }
-  .ab-label .tag-dim{color:#6b6bb0; font-size:11px;}
-  .ab-box{ border:2px solid var(--wall-dark); background:#000; padding:8px; }
-  .ab-box audio{ width:100%; display:block; }
-  canvas.wave{ width:100%; height:34px; display:block; border:2px solid var(--wall-dark); background:#000; margin-top:6px; }
+  .abw-titlebar{
+    display:flex; justify-content:space-between; align-items:center; gap:10px;
+    background:var(--wall); padding:7px 10px;
+    font-family:var(--font-display); font-size:10px; letter-spacing:1px; color:#fff;
+  }
+  .abw-meta{ font-family:var(--font-body); font-size:14px; letter-spacing:0.4px; color:var(--dot); text-align:right; }
+  .abw-wavewrap{ padding:10px 10px 0; }
+  .abw-canvas{
+    display:block; width:100%; height:120px; background:#000;
+    border:2px solid var(--wall-dark); cursor:pointer; touch-action:none;
+  }
+  .abw-time{
+    display:flex; justify-content:space-between; padding:4px 12px 0;
+    font-size:16px; letter-spacing:1px; color:var(--cyan);
+  }
+  .abw-controls{ display:flex; gap:10px; padding:10px 10px 8px; align-items:stretch; }
+  .abw-play{
+    width:56px; flex:none; display:flex; align-items:center; justify-content:center;
+    color:#000; background:var(--yellow); border:0; cursor:pointer;
+    box-shadow:0 4px 0 var(--yellow-dim);
+  }
+  .abw-play:active{ transform:translateY(4px); box-shadow:0 0 0 var(--yellow-dim); }
+  .abw-play svg{ width:20px; height:20px; display:block; fill:currentColor; shape-rendering:crispEdges; }
+  .abw-play .ic-pause{ display:none; }
+  .abw-play.playing .ic-play{ display:none; }
+  .abw-play.playing .ic-pause{ display:block; }
+  .abw-switch{ flex:1; display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  .abw-side{
+    font-family:var(--font-display); font-size:10px; letter-spacing:1px; line-height:1.2;
+    color:var(--dot); background:#000; border:2px solid var(--wall-dark);
+    padding:10px 4px; cursor:pointer;
+    display:flex; align-items:center; justify-content:center; gap:8px;
+  }
+  .abw-side .abw-k{ font-size:15px; }
+  .abw-side[data-side="A"]{ border-color:var(--wall-light); color:var(--wall-light); }
+  .abw-side[data-side="B"]{ border-color:var(--yellow-dim); color:var(--yellow); }
+  .abw-side[data-side="A"].active{ color:#000; background:var(--wall-light); border-color:var(--wall-light); }
+  .abw-side[data-side="B"].active{ color:#000; background:var(--yellow); border-color:var(--yellow); }
+  .abw-match{
+    display:flex; align-items:center; gap:10px; width:calc(100% - 20px); margin:0 10px 8px;
+    background:#000; border:2px solid var(--wall-dark); color:var(--dot);
+    font-family:var(--font-body); font-size:15px; letter-spacing:0.4px; text-align:left;
+    padding:7px 10px; cursor:pointer;
+  }
+  .abw-match .abw-box{
+    width:14px; height:14px; flex:none; border:2px solid var(--cyan); background:#000;
+  }
+  .abw-match[aria-pressed="true"]{ border-color:var(--cyan); }
+  .abw-match[aria-pressed="true"] .abw-box{ background:var(--cyan); box-shadow:0 0 8px rgba(51,230,255,0.7); }
+  .abw-note{ padding:0 12px 10px; font-size:13px; line-height:1.35; color:#6b6bb0; letter-spacing:0.3px; min-height:1px; }
+  .abw-note b{ color:var(--yellow); font-weight:normal; }
 
   .stats-block{
     border:2px solid var(--wall-dark); background:#000; padding:10px 12px; margin:18px 0;
@@ -531,6 +579,32 @@
       <div class="win-title">DONE</div>
       <div class="win-sub">your track is ready</div>
 
+      <!-- A/B MONITOR: waveform with before/after switching (logic: ABPlayer in the main script) -->
+      <div class="abw" id="ab-window">
+        <div class="abw-titlebar">
+          <span>A/B MONITOR</span>
+          <span class="abw-meta" id="abw-meta"></span>
+        </div>
+        <div class="abw-wavewrap">
+          <canvas class="abw-canvas" id="abw-canvas" aria-label="Waveform: click or drag to seek"></canvas>
+        </div>
+        <div class="abw-time"><span id="abw-pos">0:00</span><span id="abw-dur">0:00</span></div>
+        <div class="abw-controls">
+          <button class="abw-play" id="abw-play" type="button" aria-label="Play / pause">
+            <svg class="ic-play" viewBox="0 0 10 10"><path d="M2 1h2v1h1v1h1v1h1v2H6v1H5v1H4v1H2z"/></svg>
+            <svg class="ic-pause" viewBox="0 0 10 10"><path d="M2 1h2v8H2zM6 1h2v8H6z"/></svg>
+          </button>
+          <div class="abw-switch" role="group" aria-label="Compare before and after">
+            <button class="abw-side" id="abw-a" data-side="A" type="button" aria-pressed="false"><span class="abw-k">A</span>BEFORE</button>
+            <button class="abw-side active" id="abw-b" data-side="B" type="button" aria-pressed="true"><span class="abw-k">B</span>AFTER</button>
+          </div>
+        </div>
+        <button class="abw-match" id="abw-match" type="button" aria-pressed="false">
+          <span class="abw-box"></span><span>MATCH LOUDNESS</span>
+        </button>
+        <div class="abw-note" id="abw-note"></div>
+      </div>
+
       <div class="file-chip">
         <span id="file-name-out">enhanced_track.wav</span>
         <span class="tag">WAV</span>
@@ -540,14 +614,6 @@
       <div class="download-hint" id="download-hint">
         If your browser blocks the download, tap <a href="#" id="download-fallback" class="fallback-link">this direct link</a> instead — or long-press / right-click the button above and choose "Save Link As…".
       </div>
-
-      <div class="ab-label"><span>ORIGINAL</span><span class="tag-dim" id="orig-meta"></span></div>
-      <div class="ab-box"><audio id="orig-audio" controls preload="metadata"></audio></div>
-      <canvas class="wave" id="wave-orig"></canvas>
-
-      <div class="ab-label"><span>ENHANCED</span><span class="tag-dim" id="mastered-meta"></span></div>
-      <div class="ab-box"><audio id="mastered-audio" controls preload="metadata"></audio></div>
-      <canvas class="wave" id="wave-mastered"></canvas>
 
       <div class="stats-block" id="stats-block"></div>
 
@@ -2799,31 +2865,307 @@
     return 'data:audio/wav;base64,' + btoa(binary);
   }
 
-  function drawWave(canvas, left, right, color){
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.clientWidth, h = canvas.clientHeight;
-    canvas.width = w*dpr; canvas.height = h*dpr;
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.clearRect(0,0,w,h);
-    const buckets = Math.min(160, w);
-    const n = left.length;
-    const step = Math.max(1, Math.floor(n/buckets));
-    ctx.fillStyle = color;
-    const mid = h/2;
-    for(let bx=0; bx<buckets; bx++){
-      const start = bx*step;
-      let peak = 0;
-      for(let i=start; i<Math.min(n, start+step); i++){
-        const a = Math.max(Math.abs(left[i]||0), Math.abs(right[i]||0));
-        if(a>peak) peak = a;
+  // ---------------- A/B MONITOR ----------------
+  // One waveform window, two takes (A = BEFORE, B = AFTER). Both are decoded into
+  // AudioBuffers and played in lock-step through Web Audio; switching sides only
+  // crossfades two gain nodes (~25 ms), so the playback position never moves and
+  // there are no clicks. Entirely client-side, independent of the DSP block.
+  const ABPlayer = (function(){
+    const $ = (id) => document.getElementById(id);
+    const el = {
+      canvas: $('abw-canvas'), play: $('abw-play'), a: $('abw-a'), b: $('abw-b'),
+      match: $('abw-match'), pos: $('abw-pos'), dur: $('abw-dur'),
+      meta: $('abw-meta'), note: $('abw-note'),
+    };
+    const g = el.canvas.getContext('2d');
+    const COLORS = { A: [89,89,255], B: [255,212,0] };   // wall-light blue / yellow
+    const SRC_BUCKETS = 1600;                             // analysis resolution
+
+    let ctx = null, bufs = null, duration = 0;
+    let peaks = null, view = null, viewBars = 0;
+    let side = 'B', matchOn = false;
+    let matchDb = { A: 0, B: 0 };                         // level-match trims (dB)
+    let nodes = null, playing = false, token = 0;
+    let startCtxTime = 0, startOffset = 0, pausedAt = 0;
+    let dragging = false, dragPos = 0, raf = 0;
+
+    const dbToLin = (db) => Math.pow(10, db / 20);
+    const fmtTime = (s) => { s = Math.max(0, Math.floor(s)); return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); };
+
+    function computePeaks(chans){
+      const len = chans[0].length, n = SRC_BUCKETS;
+      const peak = new Float32Array(n), rms = new Float32Array(n);
+      const step = len / n;
+      for(let b = 0; b < n; b++){
+        const s = Math.floor(b * step);
+        const e = Math.min(len, Math.max(s + 1, Math.floor((b + 1) * step)));
+        let p = 0, sum = 0, cnt = 0;
+        for(let c = 0; c < chans.length; c++){
+          const d = chans[c];
+          for(let i = s; i < e; i++){
+            const v = d[i]; const a = v < 0 ? -v : v;
+            if(a > p) p = a;
+            sum += v * v; cnt++;
+          }
+        }
+        peak[b] = p; rms[b] = cnt ? Math.sqrt(sum / cnt) : 0;
       }
-      const barH = Math.max(1, peak*mid);
-      const x = (bx/buckets)*w;
-      const bw = Math.max(1, w/buckets - 1);
-      ctx.fillRect(x, mid-barH, bw, barH*2);
+      return { peak, rms };
     }
-  }
+
+    // resample analysis buckets to the number of bars that fit the canvas
+    function buildView(){
+      if(!peaks) return;
+      const w = el.canvas.clientWidth;
+      const bars = Math.max(8, Math.floor(w / 3));
+      if(view && bars === viewBars) return;
+      viewBars = bars;
+      view = {};
+      ['A','B'].forEach((s) => {
+        const vp = new Float32Array(bars), vr = new Float32Array(bars);
+        const per = SRC_BUCKETS / bars;
+        for(let i = 0; i < bars; i++){
+          const s0 = Math.floor(i * per), s1 = Math.max(s0 + 1, Math.floor((i + 1) * per));
+          let p = 0, r = 0, c = 0;
+          for(let k = s0; k < s1 && k < SRC_BUCKETS; k++){
+            if(peaks[s].peak[k] > p) p = peaks[s].peak[k];
+            r += peaks[s].rms[k]; c++;
+          }
+          vp[i] = p; vr[i] = c ? r / c : 0;
+        }
+        view[s] = { peak: vp, rms: vr };
+      });
+    }
+
+    function position(){
+      if(dragging) return dragPos;
+      if(playing && ctx) return Math.min(duration, startOffset + Math.max(0, ctx.currentTime - startCtxTime));
+      return pausedAt;
+    }
+
+    function draw(){
+      const c = el.canvas, w = c.clientWidth, h = c.clientHeight;
+      if(!w || !h) return;
+      const dpr = window.devicePixelRatio || 1;
+      if(c.width !== Math.round(w * dpr) || c.height !== Math.round(h * dpr)){
+        c.width = Math.round(w * dpr); c.height = Math.round(h * dpr);
+      }
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+      const mid = h / 2;
+
+      // centre line drawn as pellets
+      g.fillStyle = 'rgba(138,116,0,0.55)';
+      for(let x = 2; x < w; x += 9) g.fillRect(x, Math.round(mid) - 1, 2, 2);
+
+      if(!peaks || !duration) return;
+      buildView();
+      const playX = (position() / duration) * w;
+      const bw = w / viewBars;
+      const order = side === 'A' ? ['B','A'] : ['A','B'];     // inactive take first, active on top
+      order.forEach((s) => {
+        const active = (s === side), col = COLORS[s], v = view[s];
+        for(let i = 0; i < viewBars; i++){
+          const x = i * bw, played = (x + bw) <= playX;
+          const base = active ? (played ? 1 : 0.5) : (played ? 0.3 : 0.18);
+          const pk = Math.max(1, v.peak[i] * mid), rm = Math.max(1, v.rms[i] * mid * 1.35);
+          const bx = Math.floor(x), bwid = Math.max(1, Math.floor(bw) - 1);
+          g.fillStyle = 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + (base * 0.45) + ')';
+          g.fillRect(bx, mid - pk, bwid, pk * 2);
+          g.fillStyle = 'rgba(' + col[0] + ',' + col[1] + ',' + col[2] + ',' + base + ')';
+          g.fillRect(bx, mid - Math.min(rm, pk), bwid, Math.min(rm, pk) * 2);
+        }
+      });
+
+      // playhead
+      g.save();
+      g.shadowColor = 'rgba(51,230,255,0.9)'; g.shadowBlur = 8;
+      g.fillStyle = '#33e6ff';
+      g.fillRect(Math.min(w - 2, Math.max(0, Math.round(playX) - 1)), 0, 2, h);
+      g.restore();
+    }
+
+    function updateTime(){
+      el.pos.textContent = fmtTime(position());
+    }
+
+    function loop(){
+      draw(); updateTime();
+      raf = (playing || dragging) ? requestAnimationFrame(loop) : 0;
+    }
+    function kick(){ if(!raf) raf = requestAnimationFrame(loop); }
+
+    function targetGain(s){
+      const trim = matchOn ? dbToLin(matchDb[s]) : 1;
+      return (s === side) ? trim : 0;
+    }
+    function applyGains(){
+      if(!nodes || !ctx) return;
+      const now = ctx.currentTime;
+      ['A','B'].forEach((s) => {
+        const p = nodes[s].gain.gain;
+        try { p.cancelScheduledValues(now); p.setTargetAtTime(targetGain(s), now, 0.006); } catch(e){ p.value = targetGain(s); }
+      });
+    }
+
+    function stopSources(){
+      token++;
+      if(nodes){
+        ['A','B'].forEach((s) => {
+          try { nodes[s].src.onended = null; nodes[s].src.stop(); } catch(e){}
+          try { nodes[s].src.disconnect(); nodes[s].gain.disconnect(); } catch(e){}
+        });
+        nodes = null;
+      }
+    }
+
+    function startSources(offset){
+      stopSources();
+      offset = Math.max(0, Math.min(offset, Math.max(0, duration - 0.05)));
+      const t = ctx.currentTime + 0.02;
+      const my = ++token;
+      nodes = {};
+      ['A','B'].forEach((s) => {
+        const src = ctx.createBufferSource();
+        src.buffer = bufs[s];
+        const gain = ctx.createGain();
+        gain.gain.value = targetGain(s);
+        src.connect(gain); gain.connect(ctx.destination);
+        src.start(t, offset);
+        nodes[s] = { src, gain };
+      });
+      nodes.A.src.onended = () => {                       // natural end of track only
+        if(my !== token) return;
+        playing = false; pausedAt = 0; nodes = null;
+        setPlayUi(); draw(); updateTime();
+      };
+      startCtxTime = t; startOffset = offset; playing = true;
+      setPlayUi(); kick();
+    }
+
+    function setPlayUi(){
+      el.play.classList.toggle('playing', playing);
+      el.play.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    }
+
+    function togglePlay(){
+      if(!ctx || !bufs) return;
+      if(ctx.state === 'suspended') ctx.resume();
+      if(playing){
+        pausedAt = position();
+        stopSources(); playing = false;
+        setPlayUi(); draw(); updateTime();
+      } else {
+        if(pausedAt >= duration - 0.1) pausedAt = 0;
+        startSources(pausedAt);
+      }
+    }
+
+    function seekTo(sec){
+      sec = Math.max(0, Math.min(duration, sec));
+      pausedAt = sec;
+      if(playing) startSources(sec); else { draw(); updateTime(); }
+    }
+
+    function setSide(s){
+      side = s;
+      el.a.classList.toggle('active', s === 'A'); el.a.setAttribute('aria-pressed', String(s === 'A'));
+      el.b.classList.toggle('active', s === 'B'); el.b.setAttribute('aria-pressed', String(s === 'B'));
+      applyGains(); draw();
+    }
+
+    function setMatch(on){
+      matchOn = on;
+      el.match.setAttribute('aria-pressed', String(on));
+      applyGains();
+    }
+
+    function eventToSec(e){
+      const r = el.canvas.getBoundingClientRect();
+      return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)) * duration;
+    }
+
+    // ---- UI wiring (once) ----
+    const unfocus = (e, node) => { if(e.detail > 0) node.blur(); };   // keep Space free for play/pause
+    el.play.addEventListener('click', (e) => { togglePlay(); unfocus(e, el.play); });
+    el.a.addEventListener('click', (e) => { setSide('A'); unfocus(e, el.a); });
+    el.b.addEventListener('click', (e) => { setSide('B'); unfocus(e, el.b); });
+    el.match.addEventListener('click', (e) => { setMatch(!matchOn); unfocus(e, el.match); });
+    el.canvas.addEventListener('pointerdown', (e) => {
+      if(!duration) return;
+      dragging = true; dragPos = eventToSec(e);
+      try { el.canvas.setPointerCapture(e.pointerId); } catch(err){}
+      kick();
+    });
+    el.canvas.addEventListener('pointermove', (e) => { if(dragging) dragPos = eventToSec(e); });
+    const endDrag = (e) => {
+      if(!dragging) return;
+      const sec = (e && e.type !== 'pointercancel') ? eventToSec(e) : dragPos;
+      dragging = false; seekTo(sec);
+    };
+    el.canvas.addEventListener('pointerup', endDrag);
+    el.canvas.addEventListener('pointercancel', endDrag);
+    document.addEventListener('keydown', (e) => {
+      if(!duration || e.ctrlKey || e.metaKey || e.altKey) return;
+      if(!document.getElementById('screen-win').classList.contains('active')) return;
+      if(e.target && e.target.closest && e.target.closest('input,textarea,select,button,a')) return;
+      const k = e.key.toLowerCase();
+      if(e.code === 'Space'){ e.preventDefault(); togglePlay(); }
+      else if(k === 'a'){ setSide('A'); }
+      else if(k === 'b'){ setSide('B'); }
+      else if(k === 'm'){ setMatch(!matchOn); }
+    });
+    if(window.ResizeObserver){
+      new ResizeObserver(() => { view = null; draw(); }).observe(el.canvas);   // also fires when the screen becomes visible
+    } else {
+      window.addEventListener('resize', () => { view = null; draw(); });
+    }
+
+    function dispose(){
+      stopSources(); playing = false; dragging = false;
+      if(raf){ cancelAnimationFrame(raf); raf = 0; }
+      if(ctx){ try { ctx.close(); } catch(e){} }
+      ctx = null; bufs = null; peaks = null; view = null; duration = 0; pausedAt = 0;
+      el.meta.textContent = ''; el.note.innerHTML = ''; el.pos.textContent = '0:00'; el.dur.textContent = '0:00';
+      setMatch(false); setSide('B'); setPlayUi();
+      g.clearRect(0, 0, el.canvas.width, el.canvas.height);
+    }
+
+    // before: decoded original AudioBuffer · afterL/afterR: processed Float32Arrays
+    function load(opts){
+      dispose();
+      ctx = opts.ctx;
+      const sr = opts.sampleRate;
+      const bufA = opts.before;
+      const bufB = ctx.createBuffer(2, opts.afterL.length, sr);
+      bufB.copyToChannel(opts.afterL, 0); bufB.copyToChannel(opts.afterR, 1);
+      bufs = { A: bufA, B: bufB };
+      duration = Math.max(bufA.duration, bufB.duration);
+
+      const chA = [bufA.getChannelData(0)];
+      if(bufA.numberOfChannels > 1) chA.push(bufA.getChannelData(1));
+      peaks = { A: computePeaks(chA), B: computePeaks([opts.afterL, opts.afterR]) };
+
+      // level match: turn only the louder take down, so nothing can clip
+      const la = opts.lufsBefore, lb = opts.lufsAfter;
+      matchDb = { A: 0, B: 0 };
+      let diff = 0;
+      if(Number.isFinite(la) && Number.isFinite(lb) && la > -70 && lb > -70){
+        diff = lb - la;
+        if(diff > 0) matchDb.B = -diff; else matchDb.A = diff;
+      }
+      const fmtL = (v) => Number.isFinite(v) ? v.toFixed(1) + ' LUFS' : '—';
+      el.meta.textContent = 'A ' + fmtL(la) + ' · B ' + fmtL(lb);
+      el.dur.textContent = fmtTime(duration);
+      el.note.innerHTML = Math.abs(diff) >= 0.5
+        ? 'AFTER is <b>' + Math.abs(diff).toFixed(1) + ' dB ' + (diff > 0 ? 'louder' : 'quieter') + '</b> — louder usually sounds “better”. Turn on MATCH LOUDNESS to compare the tone fairly.'
+        : 'Click or drag the waveform to jump. Keys: Space = play, A / B = switch, M = match loudness.';
+      side = 'B'; setSide('B'); setMatch(false); setPlayUi();
+      view = null; draw(); updateTime();
+    }
+
+    return { load, dispose };
+  })();
 
   // ---------------- main flow ----------------
   // DSP engine runs in-page (see #dsp-src above) as window.MasteringChain.
@@ -2838,13 +3180,7 @@
   const downloadBtn = document.getElementById('download-btn');
   const downloadFallback = document.getElementById('download-fallback');
   const fileNameOut = document.getElementById('file-name-out');
-  const origAudio = document.getElementById('orig-audio');
-  const masteredAudio = document.getElementById('mastered-audio');
-  const origMeta = document.getElementById('orig-meta');
-  const masteredMeta = document.getElementById('mastered-meta');
   const statsBlock = document.getElementById('stats-block');
-  const waveOrig = document.getElementById('wave-orig');
-  const waveMastered = document.getElementById('wave-mastered');
   const genreRow = document.getElementById('genre-row');
 
   let selectedGenre = 'soulfunk';
@@ -2950,8 +3286,6 @@
         }
       }
 
-      const origObjUrl = trackUrl(URL.createObjectURL(blob));
-
       setProgress(12);
       const arrayBuffer = await blob.arrayBuffer();
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -3039,13 +3373,12 @@
         };
       }
 
-      origAudio.src = origObjUrl;
-      masteredAudio.src = wavUrl;
-      origMeta.textContent = Math.round(audioBuffer.duration) + 's · ' + sampleRate + 'Hz';
-      masteredMeta.textContent = Math.round(audioBuffer.duration) + 's · ' + sampleRate + 'Hz · 24-bit WAV';
-
-      drawWave(waveOrig, leftCopy, rightCopy, '#5959ff');
-      drawWave(waveMastered, result.left, result.right, '#ffd400');
+      // A/B monitor: A = decoded original (untouched — the DSP works on copies), B = processed
+      ABPlayer.load({
+        ctx: actx, before: audioBuffer, afterL: result.left, afterR: result.right,
+        sampleRate: sampleRate,
+        lufsBefore: result.meta.originalLufs, lufsAfter: result.meta.lufsAfter,
+      });
 
       const m = result.meta;
       statsBlock.innerHTML = [
@@ -3079,8 +3412,7 @@
     urlInput.value = '';
     fileInput.value = '';
     fileNameDisplay.textContent = '';
-    origAudio.removeAttribute('src');
-    masteredAudio.removeAttribute('src');
+    ABPlayer.dispose();
     showScreen('input');
   });
 
