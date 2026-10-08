@@ -2816,9 +2816,13 @@
     return new Blob(chunks);
   }
 
-  function encodeWav24(left, right, sampleRate){
+  // 16-bit stereo PCM WAV with TPDF dither (±1 LSB triangular noise added before rounding,
+  // so the quantisation error is decorrelated from the music instead of turning into
+  // distortion on quiet tails). The noise source is a fixed-seed xorshift32, so the same
+  // input always produces a byte-identical file. Sample rate is kept as in the source.
+  function encodeWav16(left, right, sampleRate){
     const numChannels = 2;
-    const bytesPerSample = 3;
+    const bytesPerSample = 2;
     const blockAlign = numChannels * bytesPerSample;
     const numFrames = left.length;
     const dataSize = numFrames * blockAlign;
@@ -2835,19 +2839,28 @@
     view.setUint32(24,sampleRate,true);
     view.setUint32(28, sampleRate*blockAlign, true);
     view.setUint16(32, blockAlign, true);
-    view.setUint16(34, 24, true);
+    view.setUint16(34, 16, true);
     writeStr(36,'data');
     view.setUint32(40, dataSize, true);
+
+    let seed = 0x9E3779B9;
+    function rnd(){                                    // xorshift32 → [0,1)
+      seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
+      return (seed >>> 0) / 4294967296;
+    }
+    function q16(x){                                   // x in [-1,1] → dithered int16
+      const s = x < 0 ? x*0x8000 : x*0x7FFF;
+      let v = Math.round(s + (rnd() - rnd()));         // TPDF, ±1 LSB
+      return v > 32767 ? 32767 : (v < -32768 ? -32768 : v);
+    }
+
     let offset = 44;
     for(let i=0;i<numFrames;i++){
-      let l = Math.max(-1, Math.min(1, left[i]));
-      let r = Math.max(-1, Math.min(1, right[i]));
-      let li = Math.round(l < 0 ? l*0x800000 : l*0x7FFFFF);
-      let ri = Math.round(r < 0 ? r*0x800000 : r*0x7FFFFF);
-      view.setUint8(offset, li & 0xFF); view.setUint8(offset+1, (li>>8)&0xFF); view.setUint8(offset+2, (li>>16)&0xFF);
-      offset += 3;
-      view.setUint8(offset, ri & 0xFF); view.setUint8(offset+1, (ri>>8)&0xFF); view.setUint8(offset+2, (ri>>16)&0xFF);
-      offset += 3;
+      const l = Math.max(-1, Math.min(1, left[i]));
+      const r = Math.max(-1, Math.min(1, right[i]));
+      view.setInt16(offset, q16(l), true);
+      view.setInt16(offset+2, q16(r), true);
+      offset += 4;
     }
     return buffer; // raw ArrayBuffer — caller builds Blob and/or data URI as needed
   }
@@ -3319,7 +3332,7 @@
       setProgress(100); // eases smoothly to 100 via the animation loop, then stops itself
 
       // build outputs
-      const wavBuffer = encodeWav24(result.left, result.right, sampleRate);
+      const wavBuffer = encodeWav16(result.left, result.right, sampleRate);
       const wavBlob = new Blob([wavBuffer], {type:'audio/wav'});
       const wavUrl = trackUrl(URL.createObjectURL(wavBlob));
       const outName = (sourceLabel.replace(/\.[a-z0-9]+$/i, '') || 'track') + '_enhanced.wav';
