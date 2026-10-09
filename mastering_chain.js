@@ -212,7 +212,7 @@
   // a fuller low-mid; these are gentle pulls toward that shape, not heavy EQ.
   const GENRE_PROFILES = {
     universal: { label: 'Universal', stWidth: 1.05, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 45, transientAmount: 0.35, warmthMult: 1.0, airAmount: 0.45, mbBandGainDb: [0.5, 0.5, 0] },
-    soulfunk: { label: 'Soul / Funk', colour: 1.0, stWidth: 1.30, trueIronMixMult: 1.13, enhancerMixMult: 1.15, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 40, transientAmount: 0.32, warmthMult: 1.15, airAmount: 0.62, mbBandGainDb: [1.0, 1.0, 0] },
+    soulfunk: { label: 'Soul / Funk', colour: 0.85, stWidth: 1.30, trueIronMixMult: 1.13, enhancerMixMult: 1.15, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 40, transientAmount: 0.32, warmthMult: 1.15, airAmount: 0.62, mbBandGainDb: [1.0, 1.0, 0] },
     hiphop: { label: 'Rap / Hip-Hop', colour: 0.75, stWidth: 1.18, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 50, transientAmount: 0.40, warmthMult: 0.85, airAmount: 0.50, mbBandGainDb: [1.0, 0.5, 0] },
     edm: { label: 'EDM / House / Trap', colour: 0.5, stWidth: 1.08, trueIronMixMult: 1.0, enhancerMixMult: 0.95, lowBandRatioMult: 1.3, lowBandThreshAdjustDb: -3, monoMkrHz: 70, transientAmount: 0.45, warmthMult: 1.0, airAmount: 0.60, mbBandGainDb: [0, 0, 0] },
     // Vinyl and Tape: character modes — minimal standard processing upstream, then the
@@ -222,7 +222,7 @@
     vinyl: { label: 'Vinyl', stWidth: 1.02, trueIronMixMult: 0.6, enhancerMixMult: 0.6, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 60, transientAmount: 0.20, warmthMult: 0.7, airAmount: 0.30, mbBandGainDb: [0, 0, 0] },
     tape: { label: 'Tape / VHS', stWidth: 1.03, trueIronMixMult: 0.7, enhancerMixMult: 0.7, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 55, transientAmount: 0.22, warmthMult: 0.8, airAmount: 0.25, mbBandGainDb: [0, 0, 0] },
   };
-  // colour (Strong 1.0 / Medium 0.75 / Light 0.5): how hard the colouring stages (True
+  // colour (Strong 0.85 / Medium 0.75 / Light 0.5): how hard the colouring stages (True
   // Iron, enhancer blend, Kazrog warmth) are driven. Profiles without it (universal and
   // the vinyl/tape effects) keep the older intensityScale-only gating.
   // stWidth on the three levels is the side gain above ~1.2 kHz; the low-mids get half
@@ -1367,10 +1367,11 @@
     // (declip + tame); for a NON-hot source loaded in EDM mode, normalize up to a loud
     // -10 like any other genre so quiet EDM material still gets louder.
     const edmTarget = isHotMaster ? (originalLufs - 0.5) : -10;
-    // Firm loudness targets. Soul/Funk aims for ~-11 LUFS (roughly -7 dB RMS on typical
-    // program material) per the user's normalization spec. The output is always driven
-    // fully to these unless the source is already louder.
-    const genreTargetLUFS = { soulfunk: -11, universal: -12, hiphop: -12, vinyl: -11, tape: -11 };
+    // Firm loudness targets. Soul/Funk (Strong) aims for -11.5 LUFS: still the loudest
+    // level, but at -11 the -1 dBTP ceiling left it ~1 dB less crest than Medium and it
+    // read as less clear. The output is always driven fully to these unless the source
+    // is already louder.
+    const genreTargetLUFS = { soulfunk: -11.5, universal: -12, hiphop: -12, vinyl: -11, tape: -11 };
     const targetLUFS = options.targetLUFS != null ? options.targetLUFS
                        : (isEDM ? edmTarget : (genreTargetLUFS[genreKey] != null ? genreTargetLUFS[genreKey] : -12));
     const targetTruePeakDb = options.finalTruePeakDb != null ? options.finalTruePeakDb
