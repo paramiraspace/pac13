@@ -200,9 +200,9 @@
   // a fuller low-mid; these are gentle pulls toward that shape, not heavy EQ.
   const GENRE_PROFILES = {
     universal: { label: 'Universal', stWidth: 1.05, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 45, transientAmount: 0.35, warmthMult: 1.0, airAmount: 0.45, mbBandGainDb: [0.5, 0.5, 0] },
-    soulfunk: { label: 'Soul / Funk', stWidth: 1.15, trueIronMixMult: 1.13, enhancerMixMult: 1.15, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 40, transientAmount: 0.32, warmthMult: 1.15, airAmount: 0.62, mbBandGainDb: [1.0, 1.0, 0] },
-    hiphop: { label: 'Rap / Hip-Hop', stWidth: 1.03, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 50, transientAmount: 0.40, warmthMult: 0.85, airAmount: 0.50, mbBandGainDb: [1.0, 0.5, 0] },
-    edm: { label: 'EDM / House / Trap', stWidth: 1.00, trueIronMixMult: 1.0, enhancerMixMult: 0.95, lowBandRatioMult: 1.3, lowBandThreshAdjustDb: -3, monoMkrHz: 70, transientAmount: 0.45, warmthMult: 1.0, airAmount: 0.60, mbBandGainDb: [0, 0, 0] },
+    soulfunk: { label: 'Soul / Funk', colour: 1.0, stWidth: 1.30, trueIronMixMult: 1.13, enhancerMixMult: 1.15, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 40, transientAmount: 0.32, warmthMult: 1.15, airAmount: 0.62, mbBandGainDb: [1.0, 1.0, 0] },
+    hiphop: { label: 'Rap / Hip-Hop', colour: 0.75, stWidth: 1.18, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 50, transientAmount: 0.40, warmthMult: 0.85, airAmount: 0.50, mbBandGainDb: [1.0, 0.5, 0] },
+    edm: { label: 'EDM / House / Trap', colour: 0.5, stWidth: 1.08, trueIronMixMult: 1.0, enhancerMixMult: 0.95, lowBandRatioMult: 1.3, lowBandThreshAdjustDb: -3, monoMkrHz: 70, transientAmount: 0.45, warmthMult: 1.0, airAmount: 0.60, mbBandGainDb: [0, 0, 0] },
     // Vinyl and Tape: character modes — minimal standard processing upstream, then the
     // dedicated stage takes over. Both normalise to a fixed -11 LUFS (same as soul/funk)
     // so the character is loud and clearly audible. Multiband is skipped (no mbBandGainDb
@@ -210,7 +210,35 @@
     vinyl: { label: 'Vinyl', stWidth: 1.02, trueIronMixMult: 0.6, enhancerMixMult: 0.6, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 60, transientAmount: 0.20, warmthMult: 0.7, airAmount: 0.30, mbBandGainDb: [0, 0, 0] },
     tape: { label: 'Tape / VHS', stWidth: 1.03, trueIronMixMult: 0.7, enhancerMixMult: 0.7, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 55, transientAmount: 0.22, warmthMult: 0.8, airAmount: 0.25, mbBandGainDb: [0, 0, 0] },
   };
+  // colour (Strong 1.0 / Medium 0.75 / Light 0.5): how hard the colouring stages (True
+  // Iron, enhancer blend, Kazrog warmth) are driven. Profiles without it (universal and
+  // the vinyl/tape effects) keep the older intensityScale-only gating.
+  // stWidth on the three levels is the side gain above ~1.2 kHz; the low-mids get half
+  // of it, and it is capped on sources that are already wide (see widthForSource).
   function getGenreProfile(genre) { return GENRE_PROFILES[genre] || GENRE_PROFILES.universal; }
+
+  // Side/mid energy ratio (dB) in the 300 Hz - 8 kHz band, where stereo width is
+  // actually heard. Broadband side/mid is dominated by the (mono) bass, so any bass
+  // boost reads as "narrower" even when the stereo image is untouched.
+  function measureSideMidDb(left, right, sampleRate) {
+    const hpM = makeBiquad('highpass', 300, sampleRate, 0.707), lpM = makeBiquad('lowpass', 8000, sampleRate, 0.707);
+    const hpS = makeBiquad('highpass', 300, sampleRate, 0.707), lpS = makeBiquad('lowpass', 8000, sampleRate, 0.707);
+    let m = 0, sd = 0;
+    for (let i = 0; i < left.length; i++) {
+      const mv = lpM(hpM((left[i] + right[i]) * 0.5));
+      const sv = lpS(hpS((left[i] - right[i]) * 0.5));
+      m += mv * mv; sd += sv * sv;
+    }
+    return 10 * Math.log10(Math.max(sd, 1e-12) / Math.max(m, 1e-12));
+  }
+
+  // Don't push an already-wide source past MAX_SIDE_MID_DB (phasey, weak in mono clubs).
+  const MAX_SIDE_MID_DB = -4;
+  function widthForSource(stWidth, sourceSideMidDb) {
+    if (stWidth <= 1) return stWidth;
+    const roomDb = Math.max(0, MAX_SIDE_MID_DB - sourceSideMidDb);
+    return Math.min(stWidth, dbToLin(roomDb));
+  }
 
   // ---------------- adaptive tonal balance (measured, bidirectional) ----------------
   // The OLD tonal nudge (TONAL_NUDGE_PROFILES below) is a static, one-directional EQ:
@@ -566,6 +594,11 @@
     const monoHpFinalR = makeCrossoverHP(monoMkrHz, sampleRate);
 
     const envFollower = makeEnvelope(sampleRate, compAttackMs, compReleaseMs);
+    // Side split at 1.2 kHz: low-mid side gets half the widening, highs get all of it.
+    // sideLo + (side - sideLo) reconstructs side exactly, so width 1 is a true bypass.
+    const sideLp = makeBiquad('lowpass', 1200, sampleRate, 0.707);
+    // Only the three processing levels use the split; the effects keep flat side gain.
+    const widthLo = params.widthSplit ? 1 + (stWidth - 1) * 0.5 : stWidth;
 
     for (let i = 0; i < n; i++) {
       let l = colourBassShelfL(bassShelfL(dryL[i]));
@@ -593,7 +626,9 @@
       const highFL = monoHpFinalL(blL), highFR = monoHpFinalR(blR);
       const lowFMono = (lowFL + lowFR) * 0.5;
       const midHigh = (highFL + highFR) * 0.5;
-      const sideHigh = (highFL - highFR) * 0.5 * stWidth;
+      const side = (highFL - highFR) * 0.5;
+      const sideLo = sideLp(side);
+      const sideHigh = sideLo * widthLo + (side - sideLo) * stWidth;
       left[i] = lowFMono + midHigh + sideHigh;
       right[i] = lowFMono + midHigh - sideHigh;
     }
@@ -1231,6 +1266,13 @@
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
+    // Colour stages on the three processing levels: strength comes from the level, and
+    // density only softens it (0.6..1.0) instead of scaling it down to ~0.15-0.85 --
+    // that double attenuation left the colour almost inaudible next to the loudness gain.
+    const hasLevel = genre.colour != null;
+    const colourScale = hasLevel ? genre.colour * (0.6 + 0.4 * intensityScale) : intensityScale;
+    const sourceSideMidDb = hasLevel ? measureSideMidDb(left, right, sampleRate) : null;
+    const stWidth = hasLevel ? widthForSource(genre.stWidth, sourceSideMidDb) : genre.stWidth;
     const headroomTargetDb = -2.0 - density * 1.0;
 
     // "already loud/wide" detection for EDM: a finished, hot master (near/above 0 dBFS,
@@ -1243,6 +1285,7 @@
     const meta = {
       analysis: metrics, densityScore: density, sourceClass: sourceClass,
       genre: genreKey, genreLabel: genre.label, intensityScale: intensityScale,
+      colourScale: colourScale, stWidth: stWidth, sourceSideMidDb: sourceSideMidDb,
       headroomTargetDb: headroomTargetDb, mode: isEDM ? 'edm' : 'full',
       edmPreAttenDb: edmPreAttenDb, isHotMaster: isHotMaster,
       originalLufs: originalLufs, kazrogMakeupGainDb: 0,
@@ -1286,7 +1329,7 @@
     }});
 
     steps.push({ pct: 20, run: function () {
-      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * intensityScale });
+      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale });
       left = r1.left; right = r1.right;
     }});
 
@@ -1299,10 +1342,10 @@
 
     // EDM: much lighter enhancer blend (reference Mix ~29% vs ~67% for soul/funk).
     steps.push({ pct: 45, run: function () {
-      const enhMix = (isEDM ? 0.13 : 0.28) * genre.enhancerMixMult * intensityScale;
+      const enhMix = (isEDM ? 0.13 : 0.28) * genre.enhancerMixMult * colourScale;
       let r2 = bxEnhancerStage(left, right, {
         sampleRate: sampleRate, sculptBasis: 0.03, sculptBoost: 0.09, colourBass: 0.06, colourExcite: 0.02,
-        monoMkrHz: genre.monoMkrHz, stWidth: genre.stWidth, compThresholdDb: -10.8, compReleaseMs: 132, compAttackMs: 4,
+        monoMkrHz: genre.monoMkrHz, stWidth: stWidth, widthSplit: hasLevel, compThresholdDb: -10.8, compReleaseMs: 132, compAttackMs: 4,
         mix: enhMix, ratio: 1.4, intensityScale: intensityScale,
       });
       left = r2.left; right = r2.right;
@@ -1331,7 +1374,7 @@
     // Kazrog warmth: FULL chain only. EDM and character modes skip it.
     if (!isEDM && !isCharacterMode) {
       steps.push({ pct: 76, run: function () {
-        let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * intensityScale });
+        let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * colourScale });
         left = r4.left; right = r4.right;
         meta.kazrogMakeupGainDb = r4.makeupGainDb;
       }});
