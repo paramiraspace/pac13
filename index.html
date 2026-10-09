@@ -1509,7 +1509,11 @@
       // pass instead of one-per-path -- cheaper, and correct either way since
       // this is the only mono-sum point that matters for the actual output)
       const lowFL = monoLpFinalL(blL), lowFR = monoLpFinalR(blR);
-      const highFL = monoHpFinalL(blL), highFR = monoHpFinalR(blR);
+      // Processing levels: complementary split (high = input - low), so the mono-maker's
+      // LR4 allpass no longer smears the kick (45-130 Hz) against its attack. The effects
+      // keep the original LR4 high-pass.
+      const highFL = params.widthSplit ? blL - lowFL : monoHpFinalL(blL);
+      const highFR = params.widthSplit ? blR - lowFR : monoHpFinalR(blR);
       const lowFMono = (lowFL + lowFR) * 0.5;
       const midHigh = (highFL + highFR) * 0.5;
       const side = (highFL - highFR) * 0.5;
