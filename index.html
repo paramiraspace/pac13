@@ -158,8 +158,12 @@
     word-break:break-all; min-height:18px;
   }
 
-  .genre-row{
-    display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:6px;
+  .genre-row{ margin-top:6px; }
+  .genre-grid{ display:grid; gap:8px; }
+  .genre-grid--levels{ grid-template-columns:repeat(3, 1fr); }
+  .genre-grid--effects{ grid-template-columns:1fr 1fr; }
+  .genre-sub{
+    display:block; margin-top:4px; font-size:11px; letter-spacing:0; opacity:0.75;
   }
   .genre-btn{
     font-family:var(--font-body); font-size:15px; letter-spacing:0.3px;
@@ -536,16 +540,20 @@
       </div>
       <div class="file-name" id="file-name-display"></div>
 
-      <div class="field-label" style="margin-top:20px;">genre / style</div>
       <div class="genre-row" id="genre-row">
-        <div class="genre-btn active" data-genre="soulfunk">Soul / Funk</div>
-        <div class="genre-btn" data-genre="universal">Universal</div>
-        <div class="genre-btn" data-genre="edm">EDM / House / Trap</div>
-        <div class="genre-btn" data-genre="hiphop">Rap / Hip-Hop</div>
-        <div class="genre-btn genre-btn--character" data-genre="vinyl">🎵 Vinyl</div>
-        <div class="genre-btn genre-btn--character" data-genre="tape">📼 Tape / VHS</div>
+        <div class="field-label" style="margin-top:20px;">processing</div>
+        <div class="genre-grid genre-grid--levels">
+          <div class="genre-btn active" data-genre="soulfunk">Strong<span class="genre-sub">Soul / Funk</span></div>
+          <div class="genre-btn" data-genre="hiphop">Medium<span class="genre-sub">Rap / Hip-Hop</span></div>
+          <div class="genre-btn" data-genre="edm">Light<span class="genre-sub">EDM / House / Electronic</span></div>
+        </div>
+        <div class="field-label" style="margin-top:14px;">effects</div>
+        <div class="genre-grid genre-grid--effects">
+          <div class="genre-btn genre-btn--character" data-genre="tape">📼 Tape / VHS<span class="genre-sub">cassette effect</span></div>
+          <div class="genre-btn genre-btn--character" data-genre="vinyl">🎵 Vinyl<span class="genre-sub">vinyl effect</span></div>
+        </div>
       </div>
-      <div class="hint">target — −11/−12 LUFS (firmly normalized to target) · true peak −1 dB · <span style="color:#c87941">orange = character / sample-prep modes</span></div>
+      <div class="hint">target — −11/−12 LUFS (firmly normalized to target) · true peak −1 dB · <span style="color:#c87941">orange = effects</span></div>
 
        <div class="remaining-hint">free conversions today: <span id="trials-remaining">0</span> / <span id="trials-total">4</span></div>
       
@@ -3201,6 +3209,11 @@
   const genreRow = document.getElementById('genre-row');
 
   let selectedGenre = 'soulfunk';
+  // UI names for the DSP genre keys (the DSP profiles themselves are unchanged).
+  const MODE_LABELS = {
+    soulfunk: 'Strong (Soul / Funk)', hiphop: 'Medium (Rap / Hip-Hop)',
+    edm: 'Light (EDM / House / Electronic)', tape: 'Tape / VHS effect', vinyl: 'Vinyl effect',
+  };
   genreRow.addEventListener('click', (e) => {
     const btn = e.target.closest('.genre-btn');
     if (!btn) return;
@@ -3399,7 +3412,7 @@
 
       const m = result.meta;
       statsBlock.innerHTML = [
-        ['genre', m.genreLabel],
+        ['processing', MODE_LABELS[m.genre] || m.genreLabel],
         ['mode', m.mode + (m.mode === 'edm' && m.edmPreAttenDb ? ' (−3 dB pre-attenuation applied)' : '')],
         ['density score', fmt(m.densityScore,2) + ' (0=sparse, 1=dense)'],
         ['source RMS', fmt(m.analysis.rmsDb,1) + ' dB'],
