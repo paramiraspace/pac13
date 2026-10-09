@@ -356,6 +356,18 @@
   .abw-note{ padding:0 12px 10px; font-size:13px; line-height:1.35; color:#6b6bb0; letter-spacing:0.3px; min-height:1px; }
   .abw-note b{ color:var(--yellow); font-weight:normal; }
 
+  /* Track analysis card (processing levels): what was measured and what was adapted */
+  .analysis-card{
+    border:2px solid var(--green); background:#000; padding:10px 12px; margin:18px 0 0;
+    font-size:14.5px; line-height:1.45; letter-spacing:0.3px; color:#9be6ff;
+  }
+  .analysis-card[hidden]{ display:none; }
+  .analysis-card .ac-title{ font-family:var(--font-display); font-size:10px; color:var(--green); letter-spacing:1px; margin-bottom:6px; }
+  .analysis-card .ac-row{ margin-top:4px; }
+  .analysis-card .ac-k{ color:#6b6bb0; }
+  .analysis-card .ac-v{ color:var(--yellow); }
+  .analysis-card .ac-a{ color:var(--green); padding-left:12px; }
+
   .stats-block{
     border:2px solid var(--wall-dark); background:#000; padding:10px 12px; margin:18px 0;
     font-size:14.5px; color:#9be6ff; line-height:1.55; letter-spacing:0.3px;
@@ -638,6 +650,7 @@
         If your browser blocks the download, tap <a href="#" id="download-fallback" class="fallback-link">this direct link</a> instead — or long-press / right-click the button above and choose "Save Link As…".
       </div>
 
+      <div class="analysis-card" id="analysis-card" hidden></div>
       <div class="stats-block" id="stats-block"></div>
 
       <button class="btn ghost" id="restart-btn">CONVERT ANOTHER TRACK</button>
@@ -1039,6 +1052,57 @@
     return { rmsDb, peakDb, crestFactorDb, wideSpectrumRatio };
   }
 
+  // ---------------- source analysis: averaged spectrum (processing levels) ----------------
+  // One Welch pass (64 Hann frames of 4096, mono) gives the features the levels adapt to:
+  //  - cutoffHz: brick-wall HF cutoff left by lossy encoding (null if full band)
+  //  - presenceDb: 2.5-5 kHz vs 0.5-2 kHz energy (pink noise ~-2.8; higher = harsher)
+  //  - lowDb: 40-120 Hz vs 0.5-2 kHz energy (pink 0; typical EDM master ~+12..+16)
+  function fftInPlace(re, im) { // radix-2, n power of two
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) { let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+      for (let i = 0; i < n; i += len) { let cr = 1, ci = 0;
+        for (let k = 0; k < len / 2; k++) { const a = i + k, b = a + len / 2;
+          const tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+          re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+          const ncr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = ncr; } } }
+  }
+  function averageSpectrum(left, right, sampleRate) {
+    const N = 4096, frames = 64, n = left.length;
+    const win = new Float64Array(N); for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N - 1));
+    const pow = new Float64Array(N / 2); const re = new Float64Array(N), im = new Float64Array(N);
+    let used = 0;
+    if (n < N) return null;
+    const step = Math.max(1, Math.floor((n - N) / frames));
+    for (let f = 0; f < frames; f++) { const st = f * step; if (st + N > n) break;
+      let e = 0; for (let i = 0; i < N; i++) { const v = (left[st + i] + right[st + i]) * 0.5; re[i] = v * win[i]; im[i] = 0; e += v * v; }
+      if (e < 1e-10) continue; // skip silence
+      fftInPlace(re, im); for (let k = 0; k < N / 2; k++) pow[k] += re[k] * re[k] + im[k] * im[k]; used++; }
+    if (!used) return null;
+    return { pow, binHz: sampleRate / N };
+  }
+  function bandEnergy(sp, lo, hi) { let e = 0; const a = Math.max(1, Math.round(lo / sp.binHz)), b = Math.min(sp.pow.length - 1, Math.round(hi / sp.binHz)); for (let k = a; k <= b; k++) e += sp.pow[k]; return e; }
+  function dB(x) { return 10 * Math.log10(Math.max(x, 1e-20)); }
+  function spectralFeatures(left, right, sampleRate) {
+    const sp = averageSpectrum(left, right, sampleRate); if (!sp) return null;
+    // brick-wall HF cutoff (lossy encoders): 250 Hz bands from 11 kHz up
+    const nyq = sampleRate / 2, bands = [];
+    for (let f = 11000; f + 250 <= Math.min(nyq - 250, 22000); f += 250) bands.push({ f, db: dB(bandEnergy(sp, f, f + 250)) });
+    let cutoffHz = null;
+    for (let k = 0; k + 3 < bands.length; k++) {
+      const drop = bands[k].db - bands[k + 2].db;
+      let restMax = -Infinity; for (let j = k + 2; j < bands.length; j++) restMax = Math.max(restMax, bands[j].db);
+      if (drop > 15 && restMax < bands[k].db - 12) { cutoffHz = bands[k].f + 250; break; }
+    }
+    const mid = bandEnergy(sp, 500, 2000);
+    return {
+      cutoffHz,
+      presenceDb: dB(bandEnergy(sp, 2500, 5000)) - dB(mid),   // harshness indicator
+      lowDb: dB(bandEnergy(sp, 40, 120)) - dB(mid),           // low-end weight
+    };
+  }
+
   // Continuous 0..1 "how dense/loud/wide is this source" score, replacing the old
   // binary normal/dense_dynamic switch so every track gets a proportionate amount
   // of processing instead of one of two fixed settings.
@@ -1342,8 +1406,9 @@
     // that flattens hit-vs-background contrast. The processing levels normalise by drive
     // instead (unity gain for quiet signals, only peaks are rounded).
     const tanhDrive = params.unityGain ? drive : Math.tanh(drive);
-    const lowShelfL = makeBiquad('lowshelf', 90, params.sampleRate, 0.707, 1.2);
-    const lowShelfR = makeBiquad('lowshelf', 90, params.sampleRate, 0.707, 1.2);
+    const lowShelfDb = 1.2 * (params.lowScale != null ? params.lowScale : 1);
+    const lowShelfL = makeBiquad('lowshelf', 90, params.sampleRate, 0.707, lowShelfDb);
+    const lowShelfR = makeBiquad('lowshelf', 90, params.sampleRate, 0.707, lowShelfDb);
 
     function sat(x) {
       const wet = Math.tanh(x * drive) / tanhDrive;
@@ -1399,7 +1464,8 @@
   //     boosting high-frequency transients (cymbal/hat/consonant attacks) for
   //     "readable", crisp detail without raising sustained hiss.
   // Plus a gentle high-shelf to compensate the measured ~1dB crossover treble loss.
-  function airExciterStage(left, right, sampleRate, amount) {
+  function airExciterStage(left, right, sampleRate, amount, adapt) {
+    adapt = adapt || {};
     if (!amount || amount <= 0) return { left, right };
     const n = left.length;
 
@@ -1408,8 +1474,9 @@
     // 9k for the top octave) reconstruct the measured crossover loss curve more evenly
     // than a single shelf, which otherwise leaves a 4-8kHz notch.
     const compScale = clamp(amount / 0.5, 0, 1);
-    const compLowL = makeBiquad('highshelf', 3500, sampleRate, 0.6, 1.0 * compScale);
-    const compLowR = makeBiquad('highshelf', 3500, sampleRate, 0.6, 1.0 * compScale);
+    const presenceScale = adapt.presenceScale != null ? adapt.presenceScale : 1;
+    const compLowL = makeBiquad('highshelf', 3500, sampleRate, 0.6, 1.0 * compScale * presenceScale);
+    const compLowR = makeBiquad('highshelf', 3500, sampleRate, 0.6, 1.0 * compScale * presenceScale);
     const compShelfL = makeBiquad('highshelf', 9000, sampleRate, 0.7, 0.8 * compScale);
     const compShelfR = makeBiquad('highshelf', 9000, sampleRate, 0.7, 0.8 * compScale);
 
@@ -1417,8 +1484,11 @@
     const hpGenL = makeCrossoverHP(7500, sampleRate);
     const hpGenR = makeCrossoverHP(7500, sampleRate);
     // band-limit the generated harmonics so we don't create aliasing-like harshness
-    const genLpL = makeBiquad('lowpass', 17000, sampleRate, 0.7);
-    const genLpR = makeBiquad('lowpass', 17000, sampleRate, 0.7);
+    // On a band-limited (lossy) source the rebuilt harmonics may reach higher, to refill
+    // the empty octave above the encoder's cutoff.
+    const genLpHz = Math.min(adapt.genLpHz || 17000, sampleRate / 2 - 500);
+    const genLpL = makeBiquad('lowpass', genLpHz, sampleRate, 0.7);
+    const genLpR = makeBiquad('lowpass', genLpHz, sampleRate, 0.7);
 
     // HF transient detector (on a high-passed sidechain)
     const hpDetL = makeCrossoverHP(5000, sampleRate);
@@ -1433,7 +1503,7 @@
     const sparkleHpL = makeCrossoverHP(7000, sampleRate);
     const sparkleHpR = makeCrossoverHP(7000, sampleRate);
 
-    const genMix = 0.12 * amount;      // how much synthesized harmonic content to add
+    const genMix = 0.12 * amount * (adapt.genBoost || 1); // synthesized harmonic content
     const sparkleAmount = 0.6 * amount; // HF transient boost depth
 
     for (let i = 0; i < n; i++) {
@@ -1486,12 +1556,14 @@
     const n = left.length;
     const dryL = left.slice(), dryR = right.slice();
 
-    const bassShelfL = makeBiquad('lowshelf', 150, sampleRate, 0.707, sculptBasis * 6);
-    const bassShelfR = makeBiquad('lowshelf', 150, sampleRate, 0.707, sculptBasis * 6);
-    const presenceL = makeBiquad('peaking', 2500, sampleRate, 0.9, sculptBoost * 9);
-    const presenceR = makeBiquad('peaking', 2500, sampleRate, 0.9, sculptBoost * 9);
-    const colourBassShelfL = makeBiquad('lowshelf', 100, sampleRate, 0.707, colourBass * 10);
-    const colourBassShelfR = makeBiquad('lowshelf', 100, sampleRate, 0.707, colourBass * 10);
+    const lowScale = params.lowScale != null ? params.lowScale : 1;
+    const presScale = params.presenceScale != null ? params.presenceScale : 1;
+    const bassShelfL = makeBiquad('lowshelf', 150, sampleRate, 0.707, sculptBasis * 6 * lowScale);
+    const bassShelfR = makeBiquad('lowshelf', 150, sampleRate, 0.707, sculptBasis * 6 * lowScale);
+    const presenceL = makeBiquad('peaking', 2500, sampleRate, 0.9, sculptBoost * 9 * presScale);
+    const presenceR = makeBiquad('peaking', 2500, sampleRate, 0.9, sculptBoost * 9 * presScale);
+    const colourBassShelfL = makeBiquad('lowshelf', 100, sampleRate, 0.707, colourBass * 10 * lowScale);
+    const colourBassShelfR = makeBiquad('lowshelf', 100, sampleRate, 0.707, colourBass * 10 * lowScale);
     const exciteShelfL = makeBiquad('highshelf', 8000, sampleRate, 0.707, colourExcite * 14);
     const exciteShelfR = makeBiquad('highshelf', 8000, sampleRate, 0.707, colourExcite * 14);
     const monoLpFinalL = makeCrossoverLP(monoMkrHz, sampleRate);
@@ -2194,6 +2266,52 @@
   // analysis): it pre-attenuates a hot source by -3 dB, SKIPS the multiband compressor and
   // the Kazrog warmth stage entirely, blends the enhancer much lighter, applies no tonal
   // darkening, and does not push loudness up. Soul/funk & the other genres use the full chain.
+  function hasLevelProfile(genre) { return genre.colour != null; }
+
+  // Peak-reduction budget (dB) per processing level: how much the clipper + limiter may
+  // shave off a very dynamic source to reach the loudness target. Beyond it the target is
+  // lowered instead (never below the source's own loudness) so the hits keep their punch.
+  const DYNAMICS_BUDGET_DB = { soulfunk: 6, hiphop: 5, edm: 4 };
+
+  // Turn the measured source features into parameter changes for the processing levels,
+  // plus a human-readable report for the UI. Thresholds were calibrated on pink noise, a
+  // real EDM track (320k MP3 with a 15.75 kHz cutoff) and synthetic mixes.
+  function adaptToSource(sp, metrics, originalLufs, targetLUFS, ceilingDb, genreKey, isHotMaster, targetForced) {
+    const report = [];
+    const out = { genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, targetLUFS: targetLUFS, report: report };
+    const plr = metrics.peakDb - originalLufs;
+    report.push({ key: 'loudness', label: 'Loudness', value: originalLufs.toFixed(1) + ' LUFS, peak ' + metrics.peakDb.toFixed(1) + ' dBFS, dynamics (PLR) ' + plr.toFixed(1) + ' dB' });
+    if (sp) {
+      if (sp.cutoffHz && sp.cutoffHz < 19000) {
+        out.genBoost = 1 + clamp((19000 - sp.cutoffHz) / 3000, 0, 1);
+        out.genLpHz = 19500;
+        report.push({ key: 'bandwidth', label: 'Top end', value: 'lossy cutoff at ' + (sp.cutoffHz / 1000).toFixed(1) + ' kHz', action: 'air rebuild x' + out.genBoost.toFixed(1) + ' up to 19.5 kHz' });
+      } else {
+        report.push({ key: 'bandwidth', label: 'Top end', value: 'full bandwidth' });
+      }
+      const harsh = clamp((sp.presenceDb + 3) / 3, 0, 1);
+      out.presenceScale = 1 - 0.5 * harsh;
+      report.push({ key: 'presence', label: 'Presence 2.5-5 kHz', value: (sp.presenceDb >= 0 ? '+' : '') + sp.presenceDb.toFixed(1) + ' dB vs mids' + (harsh > 0.05 ? ' (bright)' : ''),
+        action: harsh > 0.05 ? 'own presence boosts -' + Math.round(harsh * 50) + '%' : null });
+      const boom = clamp((sp.lowDb - 13) / 5, 0, 1);
+      out.lowScale = 1 - 0.7 * boom;
+      report.push({ key: 'low', label: 'Low end 40-120 Hz', value: (sp.lowDb >= 0 ? '+' : '') + sp.lowDb.toFixed(1) + ' dB vs mids' + (boom > 0.05 ? ' (heavy)' : ''),
+        action: boom > 0.05 ? 'own bass boosts -' + Math.round(boom * 70) + '%' : null });
+    }
+    const budget = DYNAMICS_BUDGET_DB[genreKey];
+    if (!targetForced && budget != null && !isHotMaster && originalLufs > -50) {
+      const needed = plr - (ceilingDb - targetLUFS);          // dB of peaks to shave at full target
+      if (needed > budget) {
+        const capped = Math.max(ceilingDb - (plr - budget), originalLufs);
+        if (capped < targetLUFS) {
+          report.push({ key: 'dynamics', label: 'Dynamics', value: 'very dynamic source', action: 'loudness target ' + targetLUFS.toFixed(1) + ' -> ' + capped.toFixed(1) + ' LUFS to keep punch' });
+          out.targetLUFS = capped;
+        }
+      }
+    }
+    return out;
+  }
+
   function buildPipeline(leftIn, rightIn, sampleRate, options) {
     options = options || {};
     const genreKey = options.genre || 'universal';
@@ -2223,6 +2341,7 @@
     const hasAdaptiveReference = !!adaptiveRefKey;
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
+    const spectrum = hasLevelProfile(genre) ? spectralFeatures(left, right, sampleRate) : null;
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
     // Colour stages on the three processing levels: strength comes from the level, and
     // density only softens it (0.6..1.0) instead of scaling it down to ~0.15-0.85 --
@@ -2270,13 +2389,17 @@
     // read as less clear. The output is always driven fully to these unless the source
     // is already louder.
     const genreTargetLUFS = { soulfunk: -11.5, universal: -12, hiphop: -12, vinyl: -11, tape: -11 };
-    const targetLUFS = options.targetLUFS != null ? options.targetLUFS
+    let targetLUFS = options.targetLUFS != null ? options.targetLUFS
                        : (isEDM ? edmTarget : (genreTargetLUFS[genreKey] != null ? genreTargetLUFS[genreKey] : -12));
     // True-peak ceiling: -0.3 dBTP on the processing levels (as the user's own Pro-L 2
     // in Ableton) -- the extra 0.7 dB lets them reach target without costing punch.
     // The Tape / Vinyl effects keep -1.0.
     const targetTruePeakDb = options.finalTruePeakDb != null ? options.finalTruePeakDb
                        : ((isEDM || hasLevel) ? -0.3 : -1.0);
+
+    // Adaptation to the measured source (processing levels only; see adaptToSource).
+    const adapt = hasLevel ? adaptToSource(spectrum, metrics, originalLufs, targetLUFS, targetTruePeakDb, genreKey, isHotMaster, options.targetLUFS != null) : null;
+    if (adapt) { targetLUFS = adapt.targetLUFS; meta.sourceAnalysis = adapt.report; }
 
     // Each step: { pct, run(): void }.  Stages mutate left/right and meta via closures.
     const steps = [];
@@ -2296,7 +2419,7 @@
     }});
 
     steps.push({ pct: 20, run: function () {
-      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel });
+      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel, lowScale: adapt ? adapt.lowScale : 1 });
       left = r1.left; right = r1.right;
     }});
 
@@ -2314,6 +2437,7 @@
         sampleRate: sampleRate, sculptBasis: 0.03, sculptBoost: 0.09, colourBass: 0.06, colourExcite: 0.02,
         monoMkrHz: genre.monoMkrHz, stWidth: stWidth, widthSplit: hasLevel, compThresholdDb: -10.8, compReleaseMs: 132, compAttackMs: hasLevel ? ENHANCER_ATTACK_MS_LEVELS : 4,
         mix: enhMix, ratio: 1.4, intensityScale: intensityScale,
+        lowScale: adapt ? adapt.lowScale : 1, presenceScale: adapt ? adapt.presenceScale : 1,
       });
       left = r2.left; right = r2.right;
     }});
@@ -2336,7 +2460,7 @@
     // air exciter: skip for vinyl/tape (their own stages handle HF character)
     if (!isCharacterMode) {
       steps.push({ pct: 70, run: function () {
-        let ra = airExciterStage(left, right, sampleRate, genre.airAmount * (0.5 + 0.5 * intensityScale));
+        let ra = airExciterStage(left, right, sampleRate, genre.airAmount * (0.5 + 0.5 * intensityScale), adapt);
         left = ra.left; right = ra.right;
       }});
     }
@@ -2345,7 +2469,7 @@
     if (!isEDM && !isCharacterMode) {
       steps.push({ pct: 76, run: function () {
         let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * colourScale * (hasLevel ? LEVEL_WARMTH_BOOST : 1),
-          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel });
+          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel, lowScale: adapt ? adapt.lowScale : 1 });
         left = r4.left; right = r4.right;
         meta.kazrogMakeupGainDb = r4.makeupGainDb;
       }});
@@ -2434,7 +2558,7 @@
   return {
     processAudio, processAudioAsync,
     analyzeSource, classifySource, densityScore, measureLUFS,
-    measureBandBalance, buildAdaptiveTonalMoves,
+    measureBandBalance, buildAdaptiveTonalMoves, spectralFeatures,
     GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb,
   };
 });
@@ -3392,6 +3516,24 @@
   const downloadFallback = document.getElementById('download-fallback');
   const fileNameOut = document.getElementById('file-name-out');
   const statsBlock = document.getElementById('stats-block');
+  const analysisCard = document.getElementById('analysis-card');
+  // What the source analysis measured and how the processing adapted (levels only).
+  function renderAnalysisCard(items){
+    analysisCard.textContent = '';
+    if (!items || !items.length) { analysisCard.hidden = true; return; }
+    const title = document.createElement('div');
+    title.className = 'ac-title'; title.textContent = 'TRACK ANALYSIS';
+    analysisCard.appendChild(title);
+    for (const it of items) {
+      const row = document.createElement('div'); row.className = 'ac-row';
+      const k = document.createElement('span'); k.className = 'ac-k'; k.textContent = it.label + ': ';
+      const v = document.createElement('span'); v.className = 'ac-v'; v.textContent = it.value;
+      row.append(k, v);
+      if (it.action) { const a = document.createElement('div'); a.className = 'ac-a'; a.textContent = '→ ' + it.action; row.appendChild(a); }
+      analysisCard.appendChild(row);
+    }
+    analysisCard.hidden = false;
+  }
   const genreRow = document.getElementById('genre-row');
 
   let selectedGenre = 'soulfunk';
@@ -3609,6 +3751,7 @@
       });
 
       const m = result.meta;
+      renderAnalysisCard(m.sourceAnalysis);
       statsBlock.innerHTML = [
         ['processing', MODE_LABELS[m.genre] || m.genreLabel],
         ['tonal style', m.tonalStyleLabel || 'off'],
