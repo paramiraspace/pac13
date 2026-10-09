@@ -1261,8 +1261,10 @@
       effectiveTargetLUFS = targetLUFS;
     }
 
-    const maxIterations = 2; // 2 is enough to converge within ~0.1-0.2 LU in practice; a 3rd
-                              // pass cost more than it was worth given this runs on the main thread
+    // 2 passes converge within ~0.1-0.2 LU on lightly limited material. The processing
+    // levels (clipper + harder limiting on loud sources) fell ~0.6-0.8 LU short of
+    // target with 2, so they get 4.
+    const maxIterations = preClip ? 4 : 2;
     for (let iter = 0; iter < maxIterations; iter++) {
       let neededGainDb;
       if (lufsNow < -50) {
@@ -1399,8 +1401,11 @@
     const genreTargetLUFS = { soulfunk: -11.5, universal: -12, hiphop: -12, vinyl: -11, tape: -11 };
     const targetLUFS = options.targetLUFS != null ? options.targetLUFS
                        : (isEDM ? edmTarget : (genreTargetLUFS[genreKey] != null ? genreTargetLUFS[genreKey] : -12));
+    // True-peak ceiling: -0.3 dBTP on the processing levels (as the user's own Pro-L 2
+    // in Ableton) -- the extra 0.7 dB lets them reach target without costing punch.
+    // The Tape / Vinyl effects keep -1.0.
     const targetTruePeakDb = options.finalTruePeakDb != null ? options.finalTruePeakDb
-                       : (isEDM ? -0.3 : -1.0);
+                       : ((isEDM || hasLevel) ? -0.3 : -1.0);
 
     // Each step: { pct, run(): void }.  Stages mutate left/right and meta via closures.
     const steps = [];
