@@ -1051,7 +1051,7 @@
   // so the two systems shape the same regions -- this one just decides direction and
   // amount from measurement instead of assuming a neutral source.
   const ADAPTIVE_CAP_DB = 2.5;      // max cut/boost per band (protects artist intent)
-  const ADAPTIVE_STRENGTH = 0.6;    // fraction of the measured deviation we correct
+  const ADAPTIVE_STRENGTH = 0.8;    // fraction of the measured deviation we correct
 
   // Analysis band centres (Hz). Each is measured with a bandpass built from LR crossovers
   // and shaped as a peaking (or shelf at the ends) move. Ordered low -> high.
@@ -1138,7 +1138,7 @@
   }
 
   // Apply a set of measured tonal moves (same biquad-chain shape as the static nudge).
-  // intensityScale still gates the amount so already-dense sources are corrected gently.
+  // The scale argument gates the amount so already-dense sources are corrected more gently.
   function adaptiveTonalStage(left, right, sampleRate, moves, intensityScale) {
     const scale = intensityScale != null ? intensityScale : 1.0;
     if (!moves || !moves.length || scale <= 0.02) return { left, right, applied: [] };
@@ -2045,12 +2045,11 @@
 
     const metrics = analyzeSource(left, right, sampleRate);
     const originalLufs = measureLUFS(left, right, sampleRate); // on the UNTOUCHED input
-    // Measure the source's own long-term tonal balance (untouched input) so the adaptive
-    // tonal stage can correct bidirectionally toward the genre reference. Only computed
-    // when the genre actually has a reference curve, to avoid the extra pass otherwise.
-    const adaptiveMoves = ADAPTIVE_REFERENCE[genreKey]
-      ? buildAdaptiveTonalMoves(genreKey, measureBandBalance(left, right, sampleRate))
-      : null;
+    // Genres with a reference curve get the measured, bidirectional tonal stage. The
+    // band balance is measured right before that stage (not on the untouched input):
+    // the multiband, enhancer and air stages already add ~+1 dB around 2 kHz, so a
+    // correction computed from the raw source under-cuts a band that pokes out.
+    const hasAdaptiveReference = !!ADAPTIVE_REFERENCE[genreKey];
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
@@ -2181,9 +2180,14 @@
     // fall back to the legacy static nudge.
     if (!isEDM && !isCharacterMode) {
       steps.push({ pct: 85, run: function () {
-        if (adaptiveMoves) {
-          let rn = adaptiveTonalStage(left, right, sampleRate, adaptiveMoves, intensityScale);
+        if (hasAdaptiveReference) {
+          const balance = measureBandBalance(left, right, sampleRate);
+          const moves = buildAdaptiveTonalMoves(genreKey, balance);
+          // Corrective EQ is gated more gently than the colour stages: a dense, loud source
+          // with a harsh band still needs most of the cut (same gate as the air exciter).
+          let rn = adaptiveTonalStage(left, right, sampleRate, moves, 0.5 + 0.5 * intensityScale);
           left = rn.left; right = rn.right;
+          meta.tonalBalanceMeasuredDb = balance;
           meta.adaptiveTonalMoves = rn.applied;
         } else {
           let rn = tonalNudgeStage(left, right, sampleRate, genreKey, intensityScale);
