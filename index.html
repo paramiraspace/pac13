@@ -2404,16 +2404,30 @@
   // Turn the measured source features into parameter changes for the processing levels,
   // plus a human-readable report for the UI. Thresholds were calibrated on pink noise, a
   // real EDM track (320k MP3 with a 15.75 kHz cutoff) and synthetic mixes.
+  const THIN_LOW_DB = 6, BRIGHT_PRESENCE_DB = -6;
+
   function adaptToSource(sp, metrics, originalLufs, targetLUFS, ceilingDb, genreKey, isHotMaster, targetForced) {
     const report = [];
-    const out = { genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, targetLUFS: targetLUFS, report: report };
+    const out = { genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, airScale: 1, correction: null, targetLUFS: targetLUFS, report: report };
     const plr = metrics.peakDb - originalLufs;
     report.push({ key: 'loudness', label: 'Loudness', value: originalLufs.toFixed(1) + ' LUFS, peak ' + metrics.peakDb.toFixed(1) + ' dBFS, dynamics (PLR) ' + plr.toFixed(1) + ' dB' });
     if (sp) {
+      // Thin AND bright (typical of a poor MP3 / phone recording): few lows, a lot of
+      // upper mids and highs. Both conditions are required -- a dark track with little
+      // bass (the user's clean tape test track: lows -12.8, presence -61.8 dB) and a
+      // normal full track (Lumo: lows +12.4) are left exactly as before. Scaled 0..1:
+      // thin from lows +6 dB (0) to -6 dB (1), bright from presence -6 dB (0) to 0 dB (1).
+      const thin = clamp((THIN_LOW_DB - sp.lowDb) / 12, 0, 1);
+      const bright = clamp((sp.presenceDb - BRIGHT_PRESENCE_DB) / 6, 0, 1);
+      const tb = thin * bright;
       if (sp.cutoffHz && sp.cutoffHz < 19000) {
-        out.genBoost = 1 + clamp((19000 - sp.cutoffHz) / 3000, 0, 1);
         out.genLpHz = 19500;
-        report.push({ key: 'bandwidth', label: 'Top end', value: 'lossy cutoff at ' + (sp.cutoffHz / 1000).toFixed(1) + ' kHz', action: 'air rebuild x' + out.genBoost.toFixed(1) + ' up to 19.5 kHz' });
+        if (tb > 0.3) {                      // already bright: don't rebuild extra top
+          report.push({ key: 'bandwidth', label: 'Top end', value: 'lossy cutoff at ' + (sp.cutoffHz / 1000).toFixed(1) + ' kHz', action: 'no extra air rebuild (source already bright)' });
+        } else {
+          out.genBoost = 1 + clamp((19000 - sp.cutoffHz) / 3000, 0, 1);
+          report.push({ key: 'bandwidth', label: 'Top end', value: 'lossy cutoff at ' + (sp.cutoffHz / 1000).toFixed(1) + ' kHz', action: 'air rebuild x' + out.genBoost.toFixed(1) + ' up to 19.5 kHz' });
+        }
       } else {
         report.push({ key: 'bandwidth', label: 'Top end', value: 'full bandwidth' });
       }
@@ -2425,6 +2439,16 @@
       out.lowScale = 1 - 0.7 * boom;
       report.push({ key: 'low', label: 'Low end 40-120 Hz', value: (sp.lowDb >= 0 ? '+' : '') + sp.lowDb.toFixed(1) + ' dB vs mids' + (boom > 0.05 ? ' (heavy)' : ''),
         action: boom > 0.05 ? 'own bass boosts -' + Math.round(boom * 70) + '%' : null });
+
+      if (tb > 0.01) {
+        out.correction = { lowDb: 5 * tb, bodyDb: 2 * tb, topDb: -3 * tb };
+        out.lowScale *= 1 + 0.8 * tb;          // our own bass shelves work harder
+        out.presenceScale *= 1 - 0.4 * tb;     // our own presence boosts back off
+        out.airScale = 1 - 0.5 * tb;           // less added air / sparkle
+        report.push({ key: 'thinbright', label: 'Balance', value: 'thin lows + bright top (typical of a poor MP3)',
+          action: 'lows +' + out.correction.lowDb.toFixed(1) + ' dB, body +' + out.correction.bodyDb.toFixed(1) + ' dB, top ' +
+                  out.correction.topDb.toFixed(1) + ' dB before processing; added brightness -' + Math.round(tb * 50) + '%' });
+      }
     }
     const budget = DYNAMICS_BUDGET_DB[genreKey];
     if (!targetForced && budget != null && !isHotMaster && originalLufs > -50) {
@@ -2551,6 +2575,20 @@
         left = hr.left; right = hr.right;
         meta.headroomAppliedGainDb = hr.appliedGainDb;
       }
+      // Thin + bright source: rebalance BEFORE the colour stages, so the saturation
+      // builds density from the restored lows instead of exciting the bright top.
+      if (adapt && adapt.correction) {
+        const c = adapt.correction, mk = function () {
+          return [makeBiquad('lowshelf', 100, sampleRate, 0.7, c.lowDb), makeBiquad('peaking', 220, sampleRate, 0.9, c.bodyDb),
+                  makeBiquad('highshelf', 5000, sampleRate, 0.7, c.topDb)];
+        };
+        const fl = mk(), fr = mk();
+        for (let i = 0; i < left.length; i++) {
+          let l = left[i], r = right[i];
+          for (let k = 0; k < 3; k++) { l = fl[k](l); r = fr[k](r); }
+          left[i] = l; right[i] = r;
+        }
+      }
     }});
 
     steps.push({ pct: 20, run: function () {
@@ -2595,7 +2633,7 @@
     // air exciter: skip for vinyl/tape (their own stages handle HF character)
     if (!isCharacterMode) {
       steps.push({ pct: 70, run: function () {
-        let ra = airExciterStage(left, right, sampleRate, genre.airAmount * (0.5 + 0.5 * intensityScale), adapt);
+        let ra = airExciterStage(left, right, sampleRate, genre.airAmount * (0.5 + 0.5 * intensityScale) * (adapt ? adapt.airScale : 1), adapt);
         left = ra.left; right = ra.right;
       }});
     }
