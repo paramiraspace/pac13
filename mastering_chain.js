@@ -1454,7 +1454,7 @@
     return out;
   }
 
-  function buildPipeline(leftIn, rightIn, sampleRate, options) {
+  function buildPipeline(leftIn, rightIn, sampleRate, options, precomputed) {
     options = options || {};
     const genreKey = options.genre || 'universal';
     const genre = getGenreProfile(genreKey);
@@ -1483,7 +1483,8 @@
     const hasAdaptiveReference = !!adaptiveRefKey;
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
-    const spectrum = hasLevelProfile(genre) ? spectralFeatures(left, right, sampleRate) : null;
+    const spectrum = !hasLevelProfile(genre) ? null
+      : (precomputed && precomputed.spectrum !== undefined ? precomputed.spectrum : spectralFeatures(left, right, sampleRate));
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
     // Colour stages on the three processing levels: strength comes from the level, and
     // density only softens it (0.6..1.0) instead of scaling it down to ~0.15-0.85 --
@@ -1542,6 +1543,8 @@
     // Adaptation to the measured source (processing levels only; see adaptToSource).
     const adapt = hasLevel ? adaptToSource(spectrum, metrics, originalLufs, targetLUFS, targetTruePeakDb, genreKey, isHotMaster, options.targetLUFS != null) : null;
     if (adapt) { targetLUFS = adapt.targetLUFS; meta.sourceAnalysis = adapt.report; }
+    meta.plannedTargetLUFS = targetLUFS; meta.plannedCeilingDb = targetTruePeakDb;
+    meta.sourcePeakDb = metrics.peakDb;
 
     // Each step: { pct, run(): void }.  Stages mutate left/right and meta via closures.
     const steps = [];
@@ -1673,6 +1676,46 @@
     };
   }
 
+  // Analysis only (for the UI, before the user starts): the same measurements and
+  // adaptation decisions buildPipeline makes up front, without running any stage.
+  // A full-length analysis takes several seconds on the main thread, so tracks over a
+  // minute are analysed on a sample: PREVIEW_CHUNKS evenly spaced chunks plus the chunk
+  // around the loudest sample (so the peak is exact), joined with short crossfades.
+  // Loudness values are a close estimate (meta.previewSampled); the spectrum is exact.
+  const PREVIEW_CHUNKS = 40, PREVIEW_CHUNK_S = 1.5, PREVIEW_FADE_S = 0.005;
+  function previewAnalysis(leftIn, rightIn, sampleRate, options) {
+    const n = leftIn.length, chunk = Math.round(PREVIEW_CHUNK_S * sampleRate);
+    if (n <= (PREVIEW_CHUNKS + 1) * chunk) {
+      return buildPipeline(leftIn, rightIn, sampleRate, options).finalize().meta;
+    }
+    let peakIdx = 0, peak = 0;
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(Math.abs(leftIn[i]), Math.abs(rightIn[i]));
+      if (a > peak) { peak = a; peakIdx = i; }
+    }
+    const starts = [];
+    for (let k = 0; k < PREVIEW_CHUNKS; k++) starts.push(Math.floor(k * (n - chunk) / (PREVIEW_CHUNKS - 1)));
+    starts.push(clamp(peakIdx - (chunk >> 1), 0, n - chunk));
+    starts.sort(function (x, y) { return x - y; });
+    const fade = Math.max(1, Math.round(PREVIEW_FADE_S * sampleRate));
+    const L = new Float32Array(starts.length * chunk), R = new Float32Array(starts.length * chunk);
+    for (let c = 0; c < starts.length; c++) {
+      const st = starts[c], off = c * chunk;
+      for (let i = 0; i < chunk; i++) {
+        const g = i < fade ? i / fade : (i >= chunk - fade ? (chunk - 1 - i) / fade : 1);
+        // keep the loudest sample unfaded so the measured peak stays exact
+        const keep = st + i === peakIdx ? 1 : g;
+        L[off + i] = leftIn[st + i] * keep; R[off + i] = rightIn[st + i] * keep;
+      }
+    }
+    // The spectrum is cheap (~30 ms per 6 minutes), so it is taken from the whole track;
+    // only the slow loudness/dynamics measurements run on the sample.
+    const spectrum = getGenreProfile(options && options.genre).colour != null ? spectralFeatures(leftIn, rightIn, sampleRate) : null;
+    const meta = buildPipeline(L, R, sampleRate, options, { spectrum: spectrum }).finalize().meta;
+    meta.previewSampled = true;
+    return meta;
+  }
+
   async function processAudioAsync(leftIn, rightIn, sampleRate, options, onProgress) {
     const report = function (pct) { if (onProgress) onProgress(pct); };
     report(2); await nextTick();
@@ -1698,7 +1741,7 @@
   }
 
   return {
-    processAudio, processAudioAsync,
+    processAudio, processAudioAsync, previewAnalysis,
     analyzeSource, classifySource, densityScore, measureLUFS,
     measureBandBalance, buildAdaptiveTonalMoves, spectralFeatures,
     GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb,

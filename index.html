@@ -367,6 +367,8 @@
   .analysis-card .ac-k{ color:#6b6bb0; }
   .analysis-card .ac-v{ color:var(--yellow); }
   .analysis-card .ac-a{ color:var(--green); padding-left:12px; }
+  .analysis-card .ac-plan{ color:var(--cyan); margin-bottom:2px; }
+  .analysis-card .ac-note{ color:#6b6bb0; margin-top:6px; font-size:13px; }
 
   .stats-block{
     border:2px solid var(--wall-dark); background:#000; padding:10px 12px; margin:18px 0;
@@ -560,6 +562,7 @@
         <input id="src-file" type="file" accept="audio/*">
       </div>
       <div class="file-name" id="file-name-display"></div>
+      <div class="analysis-card" id="pre-analysis" hidden></div>
 
       <div class="genre-row" id="genre-row">
         <div class="field-label" style="margin-top:20px;">processing</div>
@@ -2312,7 +2315,7 @@
     return out;
   }
 
-  function buildPipeline(leftIn, rightIn, sampleRate, options) {
+  function buildPipeline(leftIn, rightIn, sampleRate, options, precomputed) {
     options = options || {};
     const genreKey = options.genre || 'universal';
     const genre = getGenreProfile(genreKey);
@@ -2341,7 +2344,8 @@
     const hasAdaptiveReference = !!adaptiveRefKey;
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
-    const spectrum = hasLevelProfile(genre) ? spectralFeatures(left, right, sampleRate) : null;
+    const spectrum = !hasLevelProfile(genre) ? null
+      : (precomputed && precomputed.spectrum !== undefined ? precomputed.spectrum : spectralFeatures(left, right, sampleRate));
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
     // Colour stages on the three processing levels: strength comes from the level, and
     // density only softens it (0.6..1.0) instead of scaling it down to ~0.15-0.85 --
@@ -2400,6 +2404,8 @@
     // Adaptation to the measured source (processing levels only; see adaptToSource).
     const adapt = hasLevel ? adaptToSource(spectrum, metrics, originalLufs, targetLUFS, targetTruePeakDb, genreKey, isHotMaster, options.targetLUFS != null) : null;
     if (adapt) { targetLUFS = adapt.targetLUFS; meta.sourceAnalysis = adapt.report; }
+    meta.plannedTargetLUFS = targetLUFS; meta.plannedCeilingDb = targetTruePeakDb;
+    meta.sourcePeakDb = metrics.peakDb;
 
     // Each step: { pct, run(): void }.  Stages mutate left/right and meta via closures.
     const steps = [];
@@ -2531,6 +2537,46 @@
     };
   }
 
+  // Analysis only (for the UI, before the user starts): the same measurements and
+  // adaptation decisions buildPipeline makes up front, without running any stage.
+  // A full-length analysis takes several seconds on the main thread, so tracks over a
+  // minute are analysed on a sample: PREVIEW_CHUNKS evenly spaced chunks plus the chunk
+  // around the loudest sample (so the peak is exact), joined with short crossfades.
+  // Loudness values are a close estimate (meta.previewSampled); the spectrum is exact.
+  const PREVIEW_CHUNKS = 40, PREVIEW_CHUNK_S = 1.5, PREVIEW_FADE_S = 0.005;
+  function previewAnalysis(leftIn, rightIn, sampleRate, options) {
+    const n = leftIn.length, chunk = Math.round(PREVIEW_CHUNK_S * sampleRate);
+    if (n <= (PREVIEW_CHUNKS + 1) * chunk) {
+      return buildPipeline(leftIn, rightIn, sampleRate, options).finalize().meta;
+    }
+    let peakIdx = 0, peak = 0;
+    for (let i = 0; i < n; i++) {
+      const a = Math.max(Math.abs(leftIn[i]), Math.abs(rightIn[i]));
+      if (a > peak) { peak = a; peakIdx = i; }
+    }
+    const starts = [];
+    for (let k = 0; k < PREVIEW_CHUNKS; k++) starts.push(Math.floor(k * (n - chunk) / (PREVIEW_CHUNKS - 1)));
+    starts.push(clamp(peakIdx - (chunk >> 1), 0, n - chunk));
+    starts.sort(function (x, y) { return x - y; });
+    const fade = Math.max(1, Math.round(PREVIEW_FADE_S * sampleRate));
+    const L = new Float32Array(starts.length * chunk), R = new Float32Array(starts.length * chunk);
+    for (let c = 0; c < starts.length; c++) {
+      const st = starts[c], off = c * chunk;
+      for (let i = 0; i < chunk; i++) {
+        const g = i < fade ? i / fade : (i >= chunk - fade ? (chunk - 1 - i) / fade : 1);
+        // keep the loudest sample unfaded so the measured peak stays exact
+        const keep = st + i === peakIdx ? 1 : g;
+        L[off + i] = leftIn[st + i] * keep; R[off + i] = rightIn[st + i] * keep;
+      }
+    }
+    // The spectrum is cheap (~30 ms per 6 minutes), so it is taken from the whole track;
+    // only the slow loudness/dynamics measurements run on the sample.
+    const spectrum = getGenreProfile(options && options.genre).colour != null ? spectralFeatures(leftIn, rightIn, sampleRate) : null;
+    const meta = buildPipeline(L, R, sampleRate, options, { spectrum: spectrum }).finalize().meta;
+    meta.previewSampled = true;
+    return meta;
+  }
+
   async function processAudioAsync(leftIn, rightIn, sampleRate, options, onProgress) {
     const report = function (pct) { if (onProgress) onProgress(pct); };
     report(2); await nextTick();
@@ -2556,7 +2602,7 @@
   }
 
   return {
-    processAudio, processAudioAsync,
+    processAudio, processAudioAsync, previewAnalysis,
     analyzeSource, classifySource, densityScore, measureLUFS,
     measureBandBalance, buildAdaptiveTonalMoves, spectralFeatures,
     GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb,
@@ -3517,22 +3563,26 @@
   const fileNameOut = document.getElementById('file-name-out');
   const statsBlock = document.getElementById('stats-block');
   const analysisCard = document.getElementById('analysis-card');
-  // What the source analysis measured and how the processing adapted (levels only).
-  function renderAnalysisCard(items){
-    analysisCard.textContent = '';
-    if (!items || !items.length) { analysisCard.hidden = true; return; }
+  // What the source analysis measured and how the processing adapts (levels only).
+  // Used twice: before START (estimate from previewAnalysis, with the plan) and on the
+  // result screen (exact values from the real run).
+  function renderAnalysisCard(items, card = analysisCard, opts = {}){
+    card.textContent = '';
+    if ((!items || !items.length) && !opts.plan && !opts.note) { card.hidden = true; return; }
     const title = document.createElement('div');
-    title.className = 'ac-title'; title.textContent = 'TRACK ANALYSIS';
-    analysisCard.appendChild(title);
-    for (const it of items) {
+    title.className = 'ac-title'; title.textContent = opts.title || 'TRACK ANALYSIS';
+    card.appendChild(title);
+    if (opts.plan) { const pl = document.createElement('div'); pl.className = 'ac-plan'; pl.textContent = opts.plan; card.appendChild(pl); }
+    for (const it of (items || [])) {
       const row = document.createElement('div'); row.className = 'ac-row';
       const k = document.createElement('span'); k.className = 'ac-k'; k.textContent = it.label + ': ';
       const v = document.createElement('span'); v.className = 'ac-v'; v.textContent = it.value;
       row.append(k, v);
       if (it.action) { const a = document.createElement('div'); a.className = 'ac-a'; a.textContent = '→ ' + it.action; row.appendChild(a); }
-      analysisCard.appendChild(row);
+      card.appendChild(row);
     }
-    analysisCard.hidden = false;
+    if (opts.note) { const nt = document.createElement('div'); nt.className = 'ac-note'; nt.textContent = opts.note; card.appendChild(nt); }
+    card.hidden = false;
   }
   const genreRow = document.getElementById('genre-row');
 
@@ -3549,6 +3599,7 @@
     selectedGenre = btn.dataset.genre;
     // tonal style doesn't apply to the tape / vinyl effects
     styleGrid.classList.toggle('is-off', selectedGenre === 'tape' || selectedGenre === 'vinyl');
+    runPreview();
   });
 
   // Tonal style: optional, one of three; clicking the active one turns it off.
@@ -3560,18 +3611,73 @@
     const st = btn.dataset.style;
     selectedStyle = selectedStyle === st ? null : st;
     styleGrid.querySelectorAll('.style-btn').forEach(b => b.classList.toggle('active', b.dataset.style === selectedStyle));
+    runPreview();
   });
 
   let currentObjectUrls = [];
   function trackUrl(u){ currentObjectUrls.push(u); return u; }
   function revokeAll(){ currentObjectUrls.forEach(u => { try{ URL.revokeObjectURL(u); }catch(e){} }); currentObjectUrls = []; }
 
-  fileInput.addEventListener('change', () => {
+  // ---- analysis before processing: decode on file pick, show the plan for the
+  // selected level / style, refresh it when either changes. The decoded buffer is reused
+  // by START so the file is only decoded once.
+  const preAnalysis = document.getElementById('pre-analysis');
+  let decodedCache = null;          // { file, buffer }
+  let previewToken = 0;
+  function planText(meta){
+    const isEffect = meta.genre === 'tape' || meta.genre === 'vinyl';
+    const st = meta.tonalStyleLabel && !isEffect ? ' + ' + meta.tonalStyleLabel : '';
+    return 'Plan: ' + (MODE_LABELS[meta.genre] || meta.genreLabel) + st + ' → '
+      + meta.plannedTargetLUFS.toFixed(1) + ' LUFS, true peak ' + meta.plannedCeilingDb + ' dB';
+  }
+  function runPreview(){
+    if (!decodedCache || !window.MasteringChain || !window.MasteringChain.previewAnalysis) return;
+    const my = ++previewToken;
+    // let the click / selection paint first; the analysis takes ~1-2 s on long tracks
+    setTimeout(() => {
+      if (my !== previewToken || !decodedCache) return;
+      const buf = decodedCache.buffer;
+      const l = buf.getChannelData(0), r = buf.numberOfChannels > 1 ? buf.getChannelData(1) : l;
+      let meta;
+      try { meta = window.MasteringChain.previewAnalysis(l, r, buf.sampleRate, { genre: selectedGenre, tonalStyle: selectedStyle }); }
+      catch (e) { console.error(e); preAnalysis.hidden = true; return; }
+      if (my !== previewToken) return;
+      const isEffect = selectedGenre === 'tape' || selectedGenre === 'vinyl';
+      const items = meta.sourceAnalysis || [{ label: 'Loudness', value: meta.originalLufs.toFixed(1) + ' LUFS, peak ' + meta.sourcePeakDb.toFixed(1) + ' dBFS' }];
+      renderAnalysisCard(items, preAnalysis, {
+        title: 'TRACK ANALYSIS · BEFORE PROCESSING',
+        plan: planText(meta),
+        note: isEffect ? 'Effects use their own fixed character and do not adapt to the analysis.'
+                       : (meta.previewSampled ? 'Estimated from a sample of the track; exact values are shown after processing.' : null),
+      });
+    }, 30);
+  }
+  function showPreviewMessage(text){
+    renderAnalysisCard(null, preAnalysis, { title: 'TRACK ANALYSIS · BEFORE PROCESSING', note: text });
+  }
+
+  fileInput.addEventListener('change', async () => {
+    decodedCache = null; previewToken++;
     if(fileInput.files && fileInput.files[0]){
-      fileNameDisplay.textContent = '✓ ' + fileInput.files[0].name;
+      const file = fileInput.files[0];
+      fileNameDisplay.textContent = '✓ ' + file.name;
       urlInput.value = '';
+      showPreviewMessage('Analysing the track…');
+      try {
+        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+        const dctx = new AudioCtx();
+        const buffer = await dctx.decodeAudioData((await file.arrayBuffer()).slice(0));
+        try { dctx.close(); } catch(e) {}
+        if (fileInput.files[0] !== file) return; // another file was picked meanwhile
+        if (buffer.duration > 600) { showPreviewMessage('Track is longer than 10 minutes — the limit is 10 minutes per track.'); return; }
+        decodedCache = { file, buffer };
+        runPreview();
+      } catch (e) {
+        if (fileInput.files[0] === file) showPreviewMessage('Could not decode this file — it does not look like a supported audio format.');
+      }
     } else {
       fileNameDisplay.textContent = '';
+      preAnalysis.hidden = true;
     }
   });
 
@@ -3662,7 +3768,9 @@
       const actx = new AudioCtx();
       let audioBuffer;
       try {
-        audioBuffer = await actx.decodeAudioData(arrayBuffer.slice(0));
+        audioBuffer = (file && decodedCache && decodedCache.file === file)
+          ? decodedCache.buffer                       // already decoded for the analysis
+          : await actx.decodeAudioData(arrayBuffer.slice(0));
       } catch(decodeErr) {
         throw new Error('could not decode the file — it does not look like a supported audio format.');
       }
