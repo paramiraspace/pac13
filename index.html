@@ -162,6 +162,15 @@
   .genre-grid{ display:grid; gap:8px; }
   .genre-grid--levels{ grid-template-columns:repeat(3, 1fr); }
   .genre-grid--effects{ grid-template-columns:1fr 1fr; }
+  /* Tonal-style buttons: optional, toggle on/off, yellow accent */
+  .style-btn{
+    font-family:var(--font-body); font-size:15px; letter-spacing:0.3px;
+    color:var(--yellow); background:#000; border:2px solid var(--yellow-dim);
+    padding:10px 6px; cursor:pointer; text-align:center; line-height:1.15;
+  }
+  .style-btn.active{ color:#000; background:var(--yellow); border-color:var(--yellow); }
+  .style-grid.is-off{ opacity:0.35; pointer-events:none; }
+  @media (max-width:420px){ .style-btn{ font-size:13px; letter-spacing:0; white-space:nowrap; } }
   .genre-sub{
     display:block; margin-top:4px; font-size:11px; letter-spacing:0; opacity:0.75;
   }
@@ -543,9 +552,15 @@
       <div class="genre-row" id="genre-row">
         <div class="field-label" style="margin-top:20px;">processing</div>
         <div class="genre-grid genre-grid--levels">
-          <div class="genre-btn active" data-genre="soulfunk">Strong<span class="genre-sub">Soul / Funk</span></div>
-          <div class="genre-btn" data-genre="hiphop">Medium<span class="genre-sub">Rap / Hip-Hop</span></div>
-          <div class="genre-btn" data-genre="edm">Light<span class="genre-sub">EDM / House / Electronic</span></div>
+          <div class="genre-btn active" data-genre="soulfunk">Strong</div>
+          <div class="genre-btn" data-genre="hiphop">Medium</div>
+          <div class="genre-btn" data-genre="edm">Light</div>
+        </div>
+        <div class="field-label" style="margin-top:14px;">tonal style <span style="text-transform:none; opacity:0.6;">(optional)</span></div>
+        <div class="genre-grid genre-grid--levels style-grid" id="style-grid">
+          <div class="style-btn" data-style="acoustic">Acoustic-Live</div>
+          <div class="style-btn" data-style="modern">Modern</div>
+          <div class="style-btn" data-style="electronic">Electronic</div>
         </div>
         <div class="field-label" style="margin-top:14px;">effects</div>
         <div class="genre-grid genre-grid--effects">
@@ -553,7 +568,7 @@
           <div class="genre-btn genre-btn--character" data-genre="vinyl">🎵 Vinyl<span class="genre-sub">vinyl effect</span></div>
         </div>
       </div>
-      <div class="hint">target — −10…−12 LUFS depending on mode (firmly normalized to target) · true peak −1 dB · <span style="color:#c87941">orange = effects</span></div>
+      <div class="hint">target — −10…−12 LUFS depending on mode (firmly normalized to target) · true peak −1 dB · yellow = tonal style (click again to turn off) · <span style="color:#c87941">orange = effects (no tonal style)</span></div>
 
        <div class="remaining-hint">free conversions today: <span id="trials-remaining">0</span> / <span id="trials-total">4</span></div>
       
@@ -1132,6 +1147,18 @@
     //          120    350    700   1800   4000   9000
     soulfunk: [ +4.0,  +1.0,  +0.5,  -0.5,  -1.5,  -3.0 ],
     hiphop:   [ +5.5,  -1.0,  +0.5,  -0.5,  -2.0,  -4.0 ],
+    // [INIT] EDM / electronic: heavy, clean lows, no low-mid shoulder, a smooth decline
+    // and a brighter top than hip-hop. A placeholder shape until it is calibrated on
+    // real electronic masters.
+    electronic: [ +6.0, -0.5, -1.0,  -1.0,  -1.5,  -2.0 ],
+  };
+
+  // User-selectable tonal styles (independent of the processing level) and the
+  // reference curve each one pulls toward.
+  const TONAL_STYLES = {
+    acoustic:   { label: 'Acoustic-Live', reference: 'soulfunk' },
+    modern:     { label: 'Modern',        reference: 'hiphop' },
+    electronic: { label: 'Electronic',    reference: 'electronic' },
   };
 
   // Measure the source's long-term average energy in each ADAPTIVE_BANDS band, expressed
@@ -2153,11 +2180,19 @@
 
     const metrics = analyzeSource(left, right, sampleRate);
     const originalLufs = measureLUFS(left, right, sampleRate); // on the UNTOUCHED input
-    // Genres with a reference curve get the measured, bidirectional tonal stage. The
-    // band balance is measured right before that stage (not on the untouched input):
-    // the multiband, enhancer and air stages already add ~+1 dB around 2 kHz, so a
-    // correction computed from the raw source under-cuts a band that pokes out.
-    const hasAdaptiveReference = !!ADAPTIVE_REFERENCE[genreKey];
+    // Tonal style: when the caller passes options.tonalStyle (the UI always does), the
+    // tonal EQ follows that choice -- one of TONAL_STYLES, or null/'off' for none --
+    // independently of the processing level. Without the key, the legacy genre-tied
+    // behaviour applies (soulfunk/hiphop reference, static nudge otherwise).
+    const styleChosen = Object.prototype.hasOwnProperty.call(options, 'tonalStyle');
+    const tonalStyle = styleChosen && TONAL_STYLES[options.tonalStyle] ? options.tonalStyle : null;
+    const adaptiveRefKey = styleChosen
+      ? (tonalStyle ? TONAL_STYLES[tonalStyle].reference : null)
+      : (ADAPTIVE_REFERENCE[genreKey] ? genreKey : null);
+    // The band balance is measured right before the tonal stage (not on the untouched
+    // input): the multiband, enhancer and air stages already add ~+1 dB around 2 kHz, so
+    // a correction computed from the raw source under-cuts a band that pokes out.
+    const hasAdaptiveReference = !!adaptiveRefKey;
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
@@ -2181,6 +2216,7 @@
       analysis: metrics, densityScore: density, sourceClass: sourceClass,
       genre: genreKey, genreLabel: genre.label, intensityScale: intensityScale,
       colourScale: colourScale, stWidth: stWidth, sourceSideMidDb: sourceSideMidDb,
+      tonalStyle: tonalStyle, tonalStyleLabel: tonalStyle ? TONAL_STYLES[tonalStyle].label : null,
       headroomTargetDb: headroomTargetDb, mode: isEDM ? 'edm' : 'full',
       edmPreAttenDb: edmPreAttenDb, isHotMaster: isHotMaster,
       originalLufs: originalLufs, kazrogMakeupGainDb: 0,
@@ -2293,14 +2329,16 @@
       }});
     }
 
-    // tonal shaping: EDM and character modes apply none. Genres with an adaptive
-    // reference (soul/funk, hip-hop) use the MEASURED bidirectional stage; all others
-    // fall back to the legacy static nudge.
-    if (!isEDM && !isCharacterMode) {
+    // tonal shaping: never on the character effects. With a chosen tonal style it runs
+    // on any processing level (Light included); with the style switched off it is skipped.
+    // Legacy callers (no tonalStyle key): EDM gets none, soul/funk and hip-hop the
+    // measured bidirectional stage, the rest the static nudge.
+    const runTonal = !isCharacterMode && (styleChosen ? hasAdaptiveReference : !isEDM);
+    if (runTonal) {
       steps.push({ pct: 85, run: function () {
         if (hasAdaptiveReference) {
           const balance = measureBandBalance(left, right, sampleRate);
-          const moves = buildAdaptiveTonalMoves(genreKey, balance);
+          const moves = buildAdaptiveTonalMoves(adaptiveRefKey, balance);
           // Corrective EQ is gated more gently than the colour stages: a dense, loud source
           // with a harsh band still needs most of the cut (same gate as the air exciter).
           let rn = adaptiveTonalStage(left, right, sampleRate, moves, 0.5 + 0.5 * intensityScale);
@@ -2359,7 +2397,7 @@
     processAudio, processAudioAsync,
     analyzeSource, classifySource, densityScore, measureLUFS,
     measureBandBalance, buildAdaptiveTonalMoves,
-    GENRE_PROFILES, dbToLin, linToDb,
+    GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb,
   };
 });
 
@@ -3321,8 +3359,7 @@
   let selectedGenre = 'soulfunk';
   // UI names for the DSP genre keys (the DSP profiles themselves are unchanged).
   const MODE_LABELS = {
-    soulfunk: 'Strong (Soul / Funk)', hiphop: 'Medium (Rap / Hip-Hop)',
-    edm: 'Light (EDM / House / Electronic)', tape: 'Tape / VHS effect', vinyl: 'Vinyl effect',
+    soulfunk: 'Strong', hiphop: 'Medium', edm: 'Light', tape: 'Tape / VHS effect', vinyl: 'Vinyl effect',
   };
   genreRow.addEventListener('click', (e) => {
     const btn = e.target.closest('.genre-btn');
@@ -3330,6 +3367,19 @@
     genreRow.querySelectorAll('.genre-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     selectedGenre = btn.dataset.genre;
+    // tonal style doesn't apply to the tape / vinyl effects
+    styleGrid.classList.toggle('is-off', selectedGenre === 'tape' || selectedGenre === 'vinyl');
+  });
+
+  // Tonal style: optional, one of three; clicking the active one turns it off.
+  const styleGrid = document.getElementById('style-grid');
+  let selectedStyle = null;
+  styleGrid.addEventListener('click', (e) => {
+    const btn = e.target.closest('.style-btn');
+    if (!btn) return;
+    const st = btn.dataset.style;
+    selectedStyle = selectedStyle === st ? null : st;
+    styleGrid.querySelectorAll('.style-btn').forEach(b => b.classList.toggle('active', b.dataset.style === selectedStyle));
   });
 
   let currentObjectUrls = [];
@@ -3452,7 +3502,7 @@
       }
 
       const result = await window.MasteringChain.processAudioAsync(
-        leftCopy, rightCopy, sampleRate, { genre: selectedGenre },
+        leftCopy, rightCopy, sampleRate, { genre: selectedGenre, tonalStyle: selectedStyle },
         (pct) => setProgress(16 + (pct/100)*84)
       );
 
@@ -3523,6 +3573,7 @@
       const m = result.meta;
       statsBlock.innerHTML = [
         ['processing', MODE_LABELS[m.genre] || m.genreLabel],
+        ['tonal style', m.tonalStyleLabel || 'off'],
         ['mode', m.mode + (m.mode === 'edm' && m.edmPreAttenDb ? ' (−3 dB pre-attenuation applied)' : '')],
         ['density score', fmt(m.densityScore,2) + ' (0=sparse, 1=dense)'],
         ['source RMS', fmt(m.analysis.rmsDb,1) + ' dB'],

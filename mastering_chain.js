@@ -302,6 +302,18 @@
     //          120    350    700   1800   4000   9000
     soulfunk: [ +4.0,  +1.0,  +0.5,  -0.5,  -1.5,  -3.0 ],
     hiphop:   [ +5.5,  -1.0,  +0.5,  -0.5,  -2.0,  -4.0 ],
+    // [INIT] EDM / electronic: heavy, clean lows, no low-mid shoulder, a smooth decline
+    // and a brighter top than hip-hop. A placeholder shape until it is calibrated on
+    // real electronic masters.
+    electronic: [ +6.0, -0.5, -1.0,  -1.0,  -1.5,  -2.0 ],
+  };
+
+  // User-selectable tonal styles (independent of the processing level) and the
+  // reference curve each one pulls toward.
+  const TONAL_STYLES = {
+    acoustic:   { label: 'Acoustic-Live', reference: 'soulfunk' },
+    modern:     { label: 'Modern',        reference: 'hiphop' },
+    electronic: { label: 'Electronic',    reference: 'electronic' },
   };
 
   // Measure the source's long-term average energy in each ADAPTIVE_BANDS band, expressed
@@ -1323,11 +1335,19 @@
 
     const metrics = analyzeSource(left, right, sampleRate);
     const originalLufs = measureLUFS(left, right, sampleRate); // on the UNTOUCHED input
-    // Genres with a reference curve get the measured, bidirectional tonal stage. The
-    // band balance is measured right before that stage (not on the untouched input):
-    // the multiband, enhancer and air stages already add ~+1 dB around 2 kHz, so a
-    // correction computed from the raw source under-cuts a band that pokes out.
-    const hasAdaptiveReference = !!ADAPTIVE_REFERENCE[genreKey];
+    // Tonal style: when the caller passes options.tonalStyle (the UI always does), the
+    // tonal EQ follows that choice -- one of TONAL_STYLES, or null/'off' for none --
+    // independently of the processing level. Without the key, the legacy genre-tied
+    // behaviour applies (soulfunk/hiphop reference, static nudge otherwise).
+    const styleChosen = Object.prototype.hasOwnProperty.call(options, 'tonalStyle');
+    const tonalStyle = styleChosen && TONAL_STYLES[options.tonalStyle] ? options.tonalStyle : null;
+    const adaptiveRefKey = styleChosen
+      ? (tonalStyle ? TONAL_STYLES[tonalStyle].reference : null)
+      : (ADAPTIVE_REFERENCE[genreKey] ? genreKey : null);
+    // The band balance is measured right before the tonal stage (not on the untouched
+    // input): the multiband, enhancer and air stages already add ~+1 dB around 2 kHz, so
+    // a correction computed from the raw source under-cuts a band that pokes out.
+    const hasAdaptiveReference = !!adaptiveRefKey;
     const density = densityScore(metrics);
     const sourceClass = classifySource(metrics, options);
     const intensityScale = 1.0 - 0.85 * Math.pow(density, 0.55);
@@ -1351,6 +1371,7 @@
       analysis: metrics, densityScore: density, sourceClass: sourceClass,
       genre: genreKey, genreLabel: genre.label, intensityScale: intensityScale,
       colourScale: colourScale, stWidth: stWidth, sourceSideMidDb: sourceSideMidDb,
+      tonalStyle: tonalStyle, tonalStyleLabel: tonalStyle ? TONAL_STYLES[tonalStyle].label : null,
       headroomTargetDb: headroomTargetDb, mode: isEDM ? 'edm' : 'full',
       edmPreAttenDb: edmPreAttenDb, isHotMaster: isHotMaster,
       originalLufs: originalLufs, kazrogMakeupGainDb: 0,
@@ -1463,14 +1484,16 @@
       }});
     }
 
-    // tonal shaping: EDM and character modes apply none. Genres with an adaptive
-    // reference (soul/funk, hip-hop) use the MEASURED bidirectional stage; all others
-    // fall back to the legacy static nudge.
-    if (!isEDM && !isCharacterMode) {
+    // tonal shaping: never on the character effects. With a chosen tonal style it runs
+    // on any processing level (Light included); with the style switched off it is skipped.
+    // Legacy callers (no tonalStyle key): EDM gets none, soul/funk and hip-hop the
+    // measured bidirectional stage, the rest the static nudge.
+    const runTonal = !isCharacterMode && (styleChosen ? hasAdaptiveReference : !isEDM);
+    if (runTonal) {
       steps.push({ pct: 85, run: function () {
         if (hasAdaptiveReference) {
           const balance = measureBandBalance(left, right, sampleRate);
-          const moves = buildAdaptiveTonalMoves(genreKey, balance);
+          const moves = buildAdaptiveTonalMoves(adaptiveRefKey, balance);
           // Corrective EQ is gated more gently than the colour stages: a dense, loud source
           // with a harsh band still needs most of the cut (same gate as the air exciter).
           let rn = adaptiveTonalStage(left, right, sampleRate, moves, 0.5 + 0.5 * intensityScale);
@@ -1529,7 +1552,7 @@
     processAudio, processAudioAsync,
     analyzeSource, classifySource, densityScore, measureLUFS,
     measureBandBalance, buildAdaptiveTonalMoves,
-    GENRE_PROFILES, dbToLin, linToDb,
+    GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb,
   };
 });
 
