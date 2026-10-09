@@ -161,6 +161,7 @@
   .genre-row{ margin-top:6px; }
   .genre-grid{ display:grid; gap:8px; }
   .genre-grid--levels{ grid-template-columns:repeat(3, 1fr); }
+  .level-grid{ gap:12px; padding:6px 4px; }
   .genre-grid--effects{ grid-template-columns:1fr 1fr; }
   /* Tonal-style buttons: optional, toggle on/off, yellow accent */
   .style-btn{
@@ -181,6 +182,27 @@
   .genre-btn.active{
     color:#000; background:var(--cyan); border-color:var(--cyan);
   }
+  /* Processing-level buttons: always filled with their own colour (Light green,
+     Medium yellow, Strong orange); the selected one lights up with a glowing rim. */
+  .genre-btn[data-genre]{
+    --lvl:#888; color:#000; background:var(--lvl); border:2px solid transparent;
+    filter:brightness(0.62) saturate(0.85);
+    transition:filter .15s ease, box-shadow .15s ease, border-color .15s ease;
+  }
+  .genre-btn[data-genre="edm"]{ --lvl:#36d96a; }
+  .genre-btn[data-genre="hiphop"]{ --lvl:#ffd400; }
+  .genre-btn[data-genre="soulfunk"]{ --lvl:#ff8a1f; }
+  .genre-btn[data-genre]:hover{ filter:brightness(0.8) saturate(0.95); }
+  .genre-btn[data-genre].active{
+    color:#000; background:var(--lvl); filter:none; border-color:#fff;
+    box-shadow:0 0 0 2px var(--lvl), 0 0 14px 2px var(--lvl), 0 0 28px 6px color-mix(in srgb, var(--lvl) 55%, transparent);
+    animation:lvl-glow 1.8s ease-in-out infinite;
+  }
+  @keyframes lvl-glow{
+    0%,100%{ box-shadow:0 0 0 2px var(--lvl), 0 0 12px 2px var(--lvl), 0 0 24px 4px color-mix(in srgb, var(--lvl) 45%, transparent); }
+    50%{ box-shadow:0 0 0 2px var(--lvl), 0 0 18px 4px var(--lvl), 0 0 34px 10px color-mix(in srgb, var(--lvl) 60%, transparent); }
+  }
+  @media (prefers-reduced-motion: reduce){ .genre-btn[data-genre].active{ animation:none; } }
   /* Character-mode buttons (vinyl/tape) get a warm orange accent */
   .genre-btn--character{
     border-color:#7a3d00; color:#c87941;
@@ -565,7 +587,7 @@
 
       <div class="genre-row" id="genre-row">
         <div class="field-label" style="margin-top:20px;">processing</div>
-        <div class="genre-grid genre-grid--levels">
+        <div class="genre-grid genre-grid--levels level-grid">
           <div class="genre-btn active" data-genre="soulfunk">Strong</div>
           <div class="genre-btn" data-genre="hiphop">Medium</div>
           <div class="genre-btn" data-genre="edm">Light</div>
