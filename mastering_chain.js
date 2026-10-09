@@ -92,6 +92,18 @@
     };
   }
 
+  // Transient guard: 0 on sustained material, rising to 1 on attacks (fast envelope
+  // 6+ dB above the slow one). Colour stages fade their wet signal out on attacks so
+  // saturation colours the body of a sound without rounding off its front edge.
+  function makeTransientGuard(sampleRate) {
+    const fast = makeEnvelope(sampleRate, 0.5, 8);
+    const slow = makeEnvelope(sampleRate, 30, 120);
+    return function (rectified) {
+      const d = linToDb(fast(rectified)) - linToDb(slow(rectified));
+      return d <= 0 ? 0 : (d >= 6 ? 1 : d / 6);
+    };
+  }
+
   // ---------------- K-weighting (ITU-R BS.1770-style) + integrated LUFS ----------------
   // Filter design values below are the standard analog-prototype parameters used to
   // redesign the BS.1770 K-weighting filters at arbitrary sample rates (stage 1: high
@@ -231,6 +243,16 @@
     }
     return 10 * Math.log10(Math.max(sd, 1e-12) / Math.max(m, 1e-12));
   }
+
+  // Punch protection on the three processing levels: how much of the saturation wet
+  // signal is faded out on attacks, and a slower enhancer-compressor attack so the
+  // front edge of a hit passes before gain reduction lands (bypassed: 4 ms).
+  const TRANSIENT_GUARD = 0.85;
+  // With unity-gain saturation the wet path no longer rides ~+5..8 dB over the dry one,
+  // so the same mix carries far fewer harmonics; the levels drive it harder to compensate.
+  const LEVEL_IRON_MIX_BOOST = 4.0;
+  const LEVEL_WARMTH_BOOST = 2.0;
+  const ENHANCER_ATTACK_MS_LEVELS = 15;
 
   // Don't push an already-wide source past MAX_SIDE_MID_DB (phasey, weak in mono clubs).
   const MAX_SIDE_MID_DB = -4;
@@ -440,7 +462,11 @@
     const mix = params.mix != null ? params.mix : 0.6;
     const drive = 1 + strength * 0.30; // gentler curve than before -- even a reduced mix% was
                                         // still costing real crest factor via harmonic stacking
-    const tanhDrive = Math.tanh(drive);
+    // Normalising by tanh(drive) gives the curve a small-signal gain of drive/tanh(drive)
+    // (~+8 dB here): quiet parts get louder while peaks are held -- upward compression
+    // that flattens hit-vs-background contrast. The processing levels normalise by drive
+    // instead (unity gain for quiet signals, only peaks are rounded).
+    const tanhDrive = params.unityGain ? drive : Math.tanh(drive);
     const lowShelfL = makeBiquad('lowshelf', 90, params.sampleRate, 0.707, 1.2);
     const lowShelfR = makeBiquad('lowshelf', 90, params.sampleRate, 0.707, 1.2);
 
@@ -450,12 +476,15 @@
       // bounded 2nd-harmonic coloration: guaranteed within [-1,1] for |wet|<=1
       return (wet + k * wet * wet * Math.sign(wet)) / (1 + k);
     }
+    const guardDepth = params.transientGuard || 0;
+    const guard = guardDepth > 0 ? makeTransientGuard(params.sampleRate) : null;
     for (let i = 0; i < left.length; i++) {
       const dl = left[i], dr = right[i];
       const wl = sat(lowShelfL(dl));
       const wr = sat(lowShelfR(dr));
-      left[i] = dl * (1 - mix) + wl * mix;
-      right[i] = dr * (1 - mix) + wr * mix;
+      const m = guard ? mix * (1 - guardDepth * guard(Math.max(Math.abs(dl), Math.abs(dr)))) : mix;
+      left[i] = dl * (1 - m) + wl * m;
+      right[i] = dr * (1 - m) + wr * m;
     }
     return { left, right };
   }
@@ -692,6 +721,13 @@
       return f;
     }
     const bandFilters = bands.map(buildBandFilters);
+    // Complementary split (levels only): low = LP(98), mid = LP(1660) - low, high = x - LP(1660).
+    // The bands sum back to the input exactly, so the crossover itself no longer smears
+    // the kick's attack against its body the way the summed LR4 allpass did.
+    const comp = params.complementary ? {
+      lpLoL: makeCrossoverLP(98.3, sampleRate), lpLoR: makeCrossoverLP(98.3, sampleRate),
+      lpHiL: makeCrossoverLP(1660, sampleRate), lpHiR: makeCrossoverLP(1660, sampleRate),
+    } : null;
     const bandEnvelopes = bands.map(function (b) { return makeEnvelope(sampleRate, b.attackMs, b.releaseMs); });
 
     const amountEnvelope = makeEnvelope(sampleRate, 10, 100);
@@ -715,11 +751,19 @@
       const amount = lerp(amountQuiet, amountLoud, t);
 
       let sumL = 0, sumR = 0;
+      let cLoL, cLoR, cHiL, cHiR;
+      if (comp) { cLoL = comp.lpLoL(dl); cLoR = comp.lpLoR(dr); cHiL = comp.lpHiL(dl); cHiR = comp.lpHiR(dr); }
       for (let b = 0; b < bands.length; b++) {
         const band = bands[b], f = bandFilters[b];
         let bl = dl, br = dr;
-        if (f.hpL) { bl = f.hpL(bl); br = f.hpR(br); }
-        if (f.lpL) { bl = f.lpL(bl); br = f.lpR(br); }
+        if (comp) {
+          if (b === 0) { bl = cLoL; br = cLoR; }
+          else if (b === 1) { bl = cHiL - cLoL; br = cHiR - cLoR; }
+          else { bl = dl - cHiL; br = dr - cHiR; }
+        } else {
+          if (f.hpL) { bl = f.hpL(bl); br = f.hpR(br); }
+          if (f.lpL) { bl = f.lpL(bl); br = f.lpR(br); }
+        }
 
         // inputGain drives the DETECTOR only (matches the reference device's
         // calibrated threshold/ratio, which assume a +6dB-hot sidechain) -- it must
@@ -763,18 +807,21 @@
     // small even-harmonic bias for tube character, bounded so it never adds gain
     const drive = 1.0 + w * 0.8; // gentler than before -- static saturation costs crest factor
                                   // even with zero gain-reduction, so keep the curve transparent
-    const tanhDrive = Math.tanh(drive);
+    const tanhDrive = params.unityGain ? drive : Math.tanh(drive); // see trueIronStage
     function tube(x) {
       const sat = Math.tanh(x * drive) / tanhDrive;
       const k = 0.04 * w;
       return (sat + k * sat * sat) / (1 + k);
     }
 
+    const guardDepth = params.transientGuard || 0;
+    const guard = guardDepth > 0 ? makeTransientGuard(params.sampleRate) : null;
     for (let i = 0; i < n; i++) {
       const dl = left[i], dr = right[i];
       const wl = tube(dl), wr = tube(dr);
-      outL[i] = dl * (1 - wetDry) + wl * wetDry;
-      outR[i] = dr * (1 - wetDry) + wr * wetDry;
+      const m = guard ? wetDry * (1 - guardDepth * guard(Math.max(Math.abs(dl), Math.abs(dr)))) : wetDry;
+      outL[i] = dl * (1 - m) + wl * m;
+      outR[i] = dr * (1 - m) + wr * m;
     }
 
     return { left: outL, right: outR, makeupGainDb: 0 }; // no makeup needed -- nothing was reduced
@@ -1157,7 +1204,24 @@
   // its own natural level, since aggressively closing that gap is exactly what forces
   // the limiter to eat into transients -- "minimal processing" has to include this
   // stage too, not just the coloration stages upstream.
-  function loudnessTargetStage(left, right, targetLUFS, targetTruePeakDb, sampleRate, originalLufs, intensityScale, allowBelowOriginal) {
+  // Pre-limiter soft clipper (processing levels only). Shaves the top of the shortest
+  // peaks so the limiter -- which ducks ~5 ms ahead and releases over 80 ms, turning down
+  // the whole hit -- has less to do. Linear below CLIP_KNEE * ceiling, then a tanh knee
+  // that never exceeds the clip level (slope 1 at the knee, so no kink).
+  const CLIP_ABOVE_CEILING_DB = 1.5; // clip level relative to the true-peak ceiling
+  const CLIP_KNEE = 0.7;
+  function softClipStage(left, right, clipDb) {
+    const c = dbToLin(clipDb), k = CLIP_KNEE * c, span = c - k;
+    function clip(x) {
+      const a = x < 0 ? -x : x;
+      if (a <= k) return x;
+      const y = k + span * Math.tanh((a - k) / span);
+      return x < 0 ? -y : y;
+    }
+    for (let i = 0; i < left.length; i++) { left[i] = clip(left[i]); right[i] = clip(right[i]); }
+  }
+
+  function loudnessTargetStage(left, right, targetLUFS, targetTruePeakDb, sampleRate, originalLufs, intensityScale, allowBelowOriginal, preClip) {
     let totalGainDb = 0;
     let limiterGainReductionDb = 0;
     let lufsBefore = measureLUFS(left, right, sampleRate);
@@ -1206,6 +1270,7 @@
         totalGainDb += neededGainDb;
       }
 
+      if (preClip) softClipStage(left, right, targetTruePeakDb + CLIP_ABOVE_CEILING_DB);
       const limited = lookaheadTruePeakLimiter(left, right, targetTruePeakDb, sampleRate, 4);
       left = limited.left; right = limited.right;
       limiterGainReductionDb = limited.limiterGainReductionDb;
@@ -1329,7 +1394,7 @@
     }});
 
     steps.push({ pct: 20, run: function () {
-      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale });
+      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel });
       left = r1.left; right = r1.right;
     }});
 
@@ -1345,7 +1410,7 @@
       const enhMix = (isEDM ? 0.13 : 0.28) * genre.enhancerMixMult * colourScale;
       let r2 = bxEnhancerStage(left, right, {
         sampleRate: sampleRate, sculptBasis: 0.03, sculptBoost: 0.09, colourBass: 0.06, colourExcite: 0.02,
-        monoMkrHz: genre.monoMkrHz, stWidth: stWidth, widthSplit: hasLevel, compThresholdDb: -10.8, compReleaseMs: 132, compAttackMs: 4,
+        monoMkrHz: genre.monoMkrHz, stWidth: stWidth, widthSplit: hasLevel, compThresholdDb: -10.8, compReleaseMs: 132, compAttackMs: hasLevel ? ENHANCER_ATTACK_MS_LEVELS : 4,
         mix: enhMix, ratio: 1.4, intensityScale: intensityScale,
       });
       left = r2.left; right = r2.right;
@@ -1357,7 +1422,7 @@
         let r3 = multibandStage(left, right, {
           sampleRate: sampleRate, intensityScale: intensityScale,
           lowBandRatioMult: genre.lowBandRatioMult, lowBandThreshAdjustDb: genre.lowBandThreshAdjustDb,
-          bandGainDb: genre.mbBandGainDb,
+          bandGainDb: genre.mbBandGainDb, complementary: hasLevel,
         });
         left = r3.left; right = r3.right;
       }});
@@ -1374,7 +1439,8 @@
     // Kazrog warmth: FULL chain only. EDM and character modes skip it.
     if (!isEDM && !isCharacterMode) {
       steps.push({ pct: 76, run: function () {
-        let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * colourScale });
+        let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * colourScale * (hasLevel ? LEVEL_WARMTH_BOOST : 1),
+          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel });
         left = r4.left; right = r4.right;
         meta.kazrogMakeupGainDb = r4.makeupGainDb;
       }});
@@ -1420,7 +1486,7 @@
     steps.push({ pct: 90, run: function () {
       // allowBelowOriginal only for genuinely hot masters (EDM declip case). A non-hot
       // source in EDM mode still normalizes up and is never pulled below its own level.
-      let r5 = loudnessTargetStage(left, right, targetLUFS, targetTruePeakDb, sampleRate, originalLufs, intensityScale, isEDM && isHotMaster);
+      let r5 = loudnessTargetStage(left, right, targetLUFS, targetTruePeakDb, sampleRate, originalLufs, intensityScale, isEDM && isHotMaster, hasLevel);
       left = r5.left; right = r5.right;
       meta.lufsBefore = r5.lufsBefore; meta.lufsAfter = r5.lufsAfter;
       meta.targetLUFS = targetLUFS; meta.loudnessGainDb = r5.totalGainDb;
