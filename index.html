@@ -707,6 +707,7 @@
       <div class="stats-block" id="stats-block"></div>
 
       <button class="btn ghost" id="restart-btn">CONVERT ANOTHER TRACK</button>
+      <button class="btn ghost" id="again-btn">PROCESS THIS TRACK AGAIN</button>
     </section>
 
     <!-- SCREEN 5 — LOGIN -->
@@ -4051,8 +4052,19 @@
     urlInput.value = '';
     fileInput.value = '';
     fileNameDisplay.textContent = '';
+    decodedCache = null; previewToken++;      // drop the previous track's analysis
+    preAnalysis.hidden = true;
     ABPlayer.dispose();
     showScreen('input');
+  });
+
+  // Back to the settings with the same track (file / link and the decoded audio kept),
+  // so the level, tonal style and effect can be changed and the track run again.
+  document.getElementById('again-btn').addEventListener('click', () => {
+    revokeAll();
+    ABPlayer.dispose();
+    showScreen('input');
+    runPreview();
   });
 
   document.getElementById('terms-back-btn').addEventListener('click', () => showScreen('input'));
