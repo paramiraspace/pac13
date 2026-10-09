@@ -189,13 +189,15 @@
      Medium yellow, Strong orange); the selected one lights up with a glowing rim. */
   .genre-btn[data-genre]{
     --lvl:#888; color:#000; background:var(--lvl); border:2px solid transparent;
-    filter:brightness(0.62) saturate(0.85);
+    filter:brightness(0.78) saturate(1.1);
+    box-shadow:0 0 8px 0 color-mix(in srgb, var(--lvl) 45%, transparent);
     transition:filter .15s ease, box-shadow .15s ease, border-color .15s ease;
   }
-  .genre-btn[data-genre="edm"]{ --lvl:#36d96a; }
-  .genre-btn[data-genre="hiphop"]{ --lvl:#ffd400; }
-  .genre-btn[data-genre="soulfunk"]{ --lvl:#ff8a1f; }
-  .genre-btn[data-genre]:hover{ filter:brightness(0.8) saturate(0.95); }
+  /* neon arcade palette: Light = neon green, Medium = Pac-Man yellow, Strong = neon orange */
+  .genre-btn[data-genre="edm"]{ --lvl:#39ff14; }
+  .genre-btn[data-genre="hiphop"]{ --lvl:#ffff00; }
+  .genre-btn[data-genre="soulfunk"]{ --lvl:#ff9100; }
+  .genre-btn[data-genre]:hover{ filter:brightness(0.92) saturate(1.15); }
   .genre-btn[data-genre].active{
     color:#000; background:var(--lvl); filter:none; border-color:#fff;
     box-shadow:0 0 0 2px var(--lvl), 0 0 14px 2px var(--lvl), 0 0 28px 6px color-mix(in srgb, var(--lvl) 55%, transparent);
@@ -210,14 +212,17 @@
      when the effect is on (reels / record spin). Colour families never overlap:
      levels green / yellow / orange, tonal style pink, effects cyan. */
   .genre-btn--character{
-    --fx:#33e6ff; color:#7fdcef; background:#03151b; border:2px solid #13505e;
+    --fx:#33e6ff; --fx-dim:#2a8fa3; --fx-edge:#13505e; --fx-bg:#03151b;
+    color:var(--fx-dim); background:var(--fx-bg); border:2px solid var(--fx-edge);
     padding:8px 6px 7px; display:flex; flex-direction:column; align-items:center; gap:5px;
     transition:box-shadow .15s ease, border-color .15s ease, color .15s ease;
   }
-  .genre-btn--character:hover{ border-color:#1f7d91; }
+  /* Tape / VHS = neon violet, Vinyl = neon cyan */
+  .genre-btn--character[data-effect="tape"]{ --fx:#c03bff; --fx-dim:#7d3aa6; --fx-edge:#4a1f66; --fx-bg:#10061a; }
+  .genre-btn--character:hover{ border-color:color-mix(in srgb, var(--fx) 55%, var(--fx-edge)); }
   .genre-btn--character.active{
-    color:var(--fx); background:#03151b; border-color:var(--fx);
-    box-shadow:0 0 0 1px var(--fx), 0 0 14px 2px rgba(51,230,255,0.55);
+    color:var(--fx); background:var(--fx-bg); border-color:var(--fx);
+    box-shadow:0 0 0 1px var(--fx), 0 0 14px 2px color-mix(in srgb, var(--fx) 60%, transparent);
   }
   .fx-name{ font-size:15px; letter-spacing:0.5px; }
   /* 8-bit stencil art: one colour (currentColor), built from pixel rects; motion is
@@ -226,16 +231,17 @@
   .fx-art .px-f, .outro-art .px-f{ display:none; }
   .fx-art:not([data-frame]) .px-f0, .outro-art:not([data-frame]) .px-f0,
   [data-frame="0"] .px-f0, [data-frame="1"] .px-f1, [data-frame="2"] .px-f2, [data-frame="3"] .px-f3{ display:inline; }
-  .genre-btn--character:not(.active){ color:#2a8fa3; }
+  .genre-btn--character:not(.active){ color:var(--fx-dim); }
 
   /* End-of-processing outro for the effect that was used (same stencil style) */
   .fx-outro{ margin:14px auto 4px; text-align:center; }
   .fx-outro[hidden]{ display:none; }
-  .outro-art{ display:none; width:min(260px, 72vw); height:auto; margin:0 auto; shape-rendering:crispEdges; fill:#33e6ff;
-    filter:drop-shadow(0 0 4px rgba(51,230,255,0.45)); }
+  .fx-outro{ --fx:#33e6ff; } .fx-outro[data-fx="tape"]{ --fx:#c03bff; }
+  .outro-art{ display:none; width:min(260px, 72vw); height:auto; margin:0 auto; shape-rendering:crispEdges; fill:var(--fx);
+    filter:drop-shadow(0 0 4px color-mix(in srgb, var(--fx) 50%, transparent)); }
   .fx-outro[data-fx="tape"] .outro-tape, .fx-outro[data-fx="vinyl"] .outro-vinyl{ display:block; }
   .outro-art .eject-fill, .outro-art .arm-b{ opacity:0; }
-  .fx-outro-cap{ margin-top:6px; font-family:var(--font-display); font-size:9px; letter-spacing:1px; color:#33e6ff; opacity:0; }
+  .fx-outro-cap{ margin-top:6px; font-family:var(--font-display); font-size:9px; letter-spacing:1px; color:var(--fx); opacity:0; }
   /* tape: (reels spin down in JS) EJECT goes down, the LED blinks, the door drops, the cassette rises */
   .fx-outro.ejected .eject-out{ opacity:0; } .fx-outro.ejected .eject-fill{ opacity:1; }
   .fx-outro.play .led{ animation:px-blink .24s steps(1) 1.5s 4; }
@@ -652,7 +658,7 @@
           </div>
         </div>
       </div>
-      <div class="hint">target — −11.5…−13.5 LUFS depending on mode (firmly normalized to target) · true peak −0.3 dB · <span style="color:#ff79c6">pink = tonal style</span>, <span style="color:#33e6ff">cyan = effect on top</span> (click again to turn off)</div>
+      <div class="hint">target — −11.5…−13.5 LUFS depending on mode (firmly normalized to target) · true peak −0.3 dB · <span style="color:#ff79c6">pink = tonal style</span>, <span style="color:#c03bff">violet</span> / <span style="color:#33e6ff">cyan = effect on top</span> (click again to turn off)</div>
 
        <div class="remaining-hint">free conversions today: <span id="trials-remaining">0</span> / <span id="trials-total">4</span></div>
       
