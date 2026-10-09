@@ -169,7 +169,6 @@
     padding:10px 6px; cursor:pointer; text-align:center; line-height:1.15;
   }
   .style-btn.active{ color:#000; background:var(--yellow); border-color:var(--yellow); }
-  .style-grid.is-off{ opacity:0.35; pointer-events:none; }
   @media (max-width:420px){ .style-btn{ font-size:13px; letter-spacing:0; white-space:nowrap; } }
   .genre-sub{
     display:block; margin-top:4px; font-size:11px; letter-spacing:0; opacity:0.75;
@@ -577,13 +576,13 @@
           <div class="style-btn" data-style="modern">Modern</div>
           <div class="style-btn" data-style="electronic">Electronic</div>
         </div>
-        <div class="field-label" style="margin-top:14px;">effects</div>
+        <div class="field-label" style="margin-top:14px;">effect on top <span style="text-transform:none; opacity:0.6;">(optional)</span></div>
         <div class="genre-grid genre-grid--effects">
-          <div class="genre-btn genre-btn--character" data-genre="tape">📼 Tape / VHS<span class="genre-sub">cassette effect</span></div>
-          <div class="genre-btn genre-btn--character" data-genre="vinyl">🎵 Vinyl<span class="genre-sub">vinyl effect</span></div>
+          <div class="genre-btn genre-btn--character" data-effect="tape">📼 Tape / VHS<span class="genre-sub">cassette effect</span></div>
+          <div class="genre-btn genre-btn--character" data-effect="vinyl">🎵 Vinyl<span class="genre-sub">vinyl effect</span></div>
         </div>
       </div>
-      <div class="hint">target — −11.5…−13.5 LUFS depending on mode (firmly normalized to target) · true peak −0.3 dB (effects −1 dB) · yellow = tonal style (click again to turn off) · <span style="color:#c87941">orange = effects (no tonal style)</span></div>
+      <div class="hint">target — −11.5…−13.5 LUFS depending on mode (firmly normalized to target) · true peak −0.3 dB · yellow = tonal style, <span style="color:#c87941">orange = effect on top</span> (click again to turn off)</div>
 
        <div class="remaining-hint">free conversions today: <span id="trials-remaining">0</span> / <span id="trials-total">4</span></div>
       
@@ -2395,6 +2394,7 @@
     // density only softens it (0.6..1.0) instead of scaling it down to ~0.15-0.85 --
     // that double attenuation left the colour almost inaudible next to the loudness gain.
     const hasLevel = genre.colour != null;
+    const effectKey = hasLevel && (options.effect === 'tape' || options.effect === 'vinyl') ? options.effect : null;
     const colourScale = hasLevel ? genre.colour * (0.6 + 0.4 * intensityScale) : intensityScale;
     const sourceSideMidDb = hasLevel ? measureSideMidDb(left, right, sampleRate) : null;
     const stWidth = hasLevel ? widthForSource(genre.stWidth, sourceSideMidDb) : genre.stWidth;
@@ -2414,6 +2414,7 @@
       genre: genreKey, genreLabel: genre.label, intensityScale: intensityScale,
       colourScale: colourScale, stWidth: stWidth, sourceSideMidDb: sourceSideMidDb,
       tonalStyle: tonalStyle, tonalStyleLabel: tonalStyle ? TONAL_STYLES[tonalStyle].label : null,
+      effect: effectKey, effectLabel: effectKey === 'tape' ? 'Tape / VHS' : (effectKey === 'vinyl' ? 'Vinyl' : null),
       headroomTargetDb: headroomTargetDb, mode: isEDM ? 'edm' : 'full',
       edmPreAttenDb: edmPreAttenDb, isHotMaster: isHotMaster,
       originalLufs: originalLufs, kazrogMakeupGainDb: 0,
@@ -2563,6 +2564,18 @@
           let rn = tonalNudgeStage(left, right, sampleRate, genreKey, intensityScale);
           left = rn.left; right = rn.right;
         }
+      }});
+    }
+
+    // Optional effect on top of a processing level (options.effect = 'tape' | 'vinyl'):
+    // it runs after the level chain and the tonal style, and before the final loudness
+    // stage, so the clipper and true-peak limiter always come last. The legacy
+    // genre 'tape' / 'vinyl' modes keep their own minimal chain above.
+    if (effectKey) {
+      steps.push({ pct: 88, run: function () {
+        const rc = effectKey === 'tape' ? tapeStage(left, right, sampleRate) : vinylStage(left, right, sampleRate);
+        left = rc.left; right = rc.right;
+        meta.characterStage = effectKey;
       }});
     }
 
@@ -3640,13 +3653,19 @@
   genreRow.addEventListener('click', (e) => {
     const btn = e.target.closest('.genre-btn');
     if (!btn) return;
-    genreRow.querySelectorAll('.genre-btn').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    selectedGenre = btn.dataset.genre;
-    // tonal style doesn't apply to the tape / vinyl effects
-    styleGrid.classList.toggle('is-off', selectedGenre === 'tape' || selectedGenre === 'vinyl');
+    if (btn.dataset.effect) {
+      // Effect on top: optional, one of two; clicking the active one turns it off.
+      const fx = btn.dataset.effect;
+      selectedEffect = selectedEffect === fx ? null : fx;
+      genreRow.querySelectorAll('.genre-btn[data-effect]').forEach(b => b.classList.toggle('active', b.dataset.effect === selectedEffect));
+    } else {
+      genreRow.querySelectorAll('.genre-btn[data-genre]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedGenre = btn.dataset.genre;
+    }
     runPreview();
   });
+  let selectedEffect = null;
 
   // Tonal style: optional, one of three; clicking the active one turns it off.
   const styleGrid = document.getElementById('style-grid');
@@ -3671,9 +3690,9 @@
   let decodedCache = null;          // { file, buffer }
   let previewToken = 0;
   function planText(meta){
-    const isEffect = meta.genre === 'tape' || meta.genre === 'vinyl';
-    const st = meta.tonalStyleLabel && !isEffect ? ' + ' + meta.tonalStyleLabel : '';
-    return 'Plan: ' + (MODE_LABELS[meta.genre] || meta.genreLabel) + st + ' → '
+    const st = meta.tonalStyleLabel ? ' + ' + meta.tonalStyleLabel : '';
+    const fx = meta.effectLabel ? ' + ' + meta.effectLabel : '';
+    return 'Plan: ' + (MODE_LABELS[meta.genre] || meta.genreLabel) + st + fx + ' → '
       + meta.plannedTargetLUFS.toFixed(1) + ' LUFS, true peak ' + meta.plannedCeilingDb + ' dB';
   }
   function runPreview(){
@@ -3685,16 +3704,14 @@
       const buf = decodedCache.buffer;
       const l = buf.getChannelData(0), r = buf.numberOfChannels > 1 ? buf.getChannelData(1) : l;
       let meta;
-      try { meta = window.MasteringChain.previewAnalysis(l, r, buf.sampleRate, { genre: selectedGenre, tonalStyle: selectedStyle }); }
+      try { meta = window.MasteringChain.previewAnalysis(l, r, buf.sampleRate, { genre: selectedGenre, tonalStyle: selectedStyle, effect: selectedEffect }); }
       catch (e) { console.error(e); preAnalysis.hidden = true; return; }
       if (my !== previewToken) return;
-      const isEffect = selectedGenre === 'tape' || selectedGenre === 'vinyl';
       const items = meta.sourceAnalysis || [{ label: 'Loudness', value: meta.originalLufs.toFixed(1) + ' LUFS, peak ' + meta.sourcePeakDb.toFixed(1) + ' dBFS' }];
       renderAnalysisCard(items, preAnalysis, {
         title: 'TRACK ANALYSIS · BEFORE PROCESSING',
         plan: planText(meta),
-        note: isEffect ? 'Effects use their own fixed character and do not adapt to the analysis.'
-                       : (meta.previewSampled ? 'Estimated from a sample of the track; exact values are shown after processing.' : null),
+        note: meta.previewSampled ? 'Estimated from a sample of the track; exact values are shown after processing.' : null,
       });
     }, 30);
   }
@@ -3836,7 +3853,7 @@
       }
 
       const result = await window.MasteringChain.processAudioAsync(
-        leftCopy, rightCopy, sampleRate, { genre: selectedGenre, tonalStyle: selectedStyle },
+        leftCopy, rightCopy, sampleRate, { genre: selectedGenre, tonalStyle: selectedStyle, effect: selectedEffect },
         (pct) => setProgress(16 + (pct/100)*84)
       );
 
@@ -3909,6 +3926,7 @@
       statsBlock.innerHTML = [
         ['processing', MODE_LABELS[m.genre] || m.genreLabel],
         ['tonal style', m.tonalStyleLabel || 'off'],
+        ['effect on top', m.effectLabel || 'none'],
         ['mode', m.mode + (m.mode === 'edm' && m.edmPreAttenDb ? ' (−3 dB pre-attenuation applied)' : '')],
         ['density score', fmt(m.densityScore,2) + ' (0=sparse, 1=dense)'],
         ['source RMS', fmt(m.analysis.rmsDb,1) + ' dB'],

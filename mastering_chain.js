@@ -1534,6 +1534,7 @@
     // density only softens it (0.6..1.0) instead of scaling it down to ~0.15-0.85 --
     // that double attenuation left the colour almost inaudible next to the loudness gain.
     const hasLevel = genre.colour != null;
+    const effectKey = hasLevel && (options.effect === 'tape' || options.effect === 'vinyl') ? options.effect : null;
     const colourScale = hasLevel ? genre.colour * (0.6 + 0.4 * intensityScale) : intensityScale;
     const sourceSideMidDb = hasLevel ? measureSideMidDb(left, right, sampleRate) : null;
     const stWidth = hasLevel ? widthForSource(genre.stWidth, sourceSideMidDb) : genre.stWidth;
@@ -1553,6 +1554,7 @@
       genre: genreKey, genreLabel: genre.label, intensityScale: intensityScale,
       colourScale: colourScale, stWidth: stWidth, sourceSideMidDb: sourceSideMidDb,
       tonalStyle: tonalStyle, tonalStyleLabel: tonalStyle ? TONAL_STYLES[tonalStyle].label : null,
+      effect: effectKey, effectLabel: effectKey === 'tape' ? 'Tape / VHS' : (effectKey === 'vinyl' ? 'Vinyl' : null),
       headroomTargetDb: headroomTargetDb, mode: isEDM ? 'edm' : 'full',
       edmPreAttenDb: edmPreAttenDb, isHotMaster: isHotMaster,
       originalLufs: originalLufs, kazrogMakeupGainDb: 0,
@@ -1702,6 +1704,18 @@
           let rn = tonalNudgeStage(left, right, sampleRate, genreKey, intensityScale);
           left = rn.left; right = rn.right;
         }
+      }});
+    }
+
+    // Optional effect on top of a processing level (options.effect = 'tape' | 'vinyl'):
+    // it runs after the level chain and the tonal style, and before the final loudness
+    // stage, so the clipper and true-peak limiter always come last. The legacy
+    // genre 'tape' / 'vinyl' modes keep their own minimal chain above.
+    if (effectKey) {
+      steps.push({ pct: 88, run: function () {
+        const rc = effectKey === 'tape' ? tapeStage(left, right, sampleRate) : vinylStage(left, right, sampleRate);
+        left = rc.left; right = rc.right;
+        meta.characterStage = effectKey;
       }});
     }
 
