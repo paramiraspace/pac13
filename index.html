@@ -1899,173 +1899,217 @@
   }
 
   // ============================================================
-  //  TAPE EMULATION STAGE — v2
-  //  Revised per user feedback:
-  //   - Hiss reduced significantly (~-48 dBFS, felt not heard)
-  //   - Flutter much slower and quieter (~0.3Hz primary), more organic
-  //   - Random modulation: flutter depth breathes up/down slowly
-  //     with occasional organic "jumps" — cassette is never perfectly
-  //     consistent, sometimes the speed drifts more at one moment
-  //   - Warm tube-preamp saturation added (2nd-harmonic even saturation
-  //     on top of tape sat — models the sound of a cheap cassette deck's
-  //     preamp, the main reason cassette sounds "velvety")
-  //   - Gentle program-dependent tape compression (loud moments are
-  //     slightly compressed, quiet ones are left alone — tape's natural
-  //     limiting behaviour from oxide saturation)
-  //   - Overall: sounds warm and intimate, not gritty or noisy
+  //  TAPE / VHS EMULATION STAGE — v4 (calibrated on the user's references)
+  //  Reference set (Oct 2026): a 30 s track exported clean and through the user's
+  //  tape chain, a 984 Hz tone through it, and 30 s of the tape's own noise.
+  //  Measured there and modelled here:
+  //   - speed (wow & flutter): four drifting components at 0.85 / 1.95 / 6.6 / 14.5 Hz,
+  //     RMS 0.66 / 0.46 / 0.39 / 0.34 % (total ~0.98 % RMS) -- random, never a fixed LFO
+  //   - saturation: odd-harmonic, H3 about -37 dB at the tone's level, H2 negligible;
+  //     driven relative to the programme level so every track gets the same density;
+  //     the lows are pre-emphasised into it ("saturated lows") and restored after
+  //   - tone: about +1 dB at 63-160 Hz, -0.5 dB around 500 Hz, top rolling off above
+  //     ~13 kHz (from the noise spectrum); no presence bump, no 10 kHz shelf
+  //   - stereo: unchanged (no crosstalk)
+  //   - hiss: the noise recording's spectrum (flat 250 Hz-10 kHz, ~-4 dB below 200 Hz,
+  //     +3 dB at 5-8 kHz, steep above 12.5 kHz), L/R correlation 0.97, sitting 51 dB
+  //     below the programme RMS
+  //  Plus, per the user's brief: gentle soft-knee compression for warmth. Deterministic
+  //  (seeded), so the same input always renders the same file.
   // ============================================================
+  const TAPE_WOW_DEPTH = 1.0;          // 1.0 = the reference's measured wow & flutter
+  const TAPE_WOW = [                    // [centre Hz, RMS fraction of speed]
+    [0.85, 0.0066], [1.95, 0.0046], [6.6, 0.0039], [14.5, 0.0034],
+  ];
+  const TAPE_SAT_DRIVE = 0.34;          // tanh argument per unit of (x / programme RMS)
+  const TAPE_LOW_EMPH_DB = 4;           // extra drive into the saturator below ~150 Hz
+  const TAPE_HISS_BELOW_RMS_DB = 51;    // hiss level under the programme RMS
+  const TAPE_GUARD = 0.85;              // share of the saturation withdrawn on attacks
+
+  function makeRng(seed) {              // mulberry32
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function makeGauss(rng) {             // Box-Muller
+    let spare = null;
+    return function () {
+      if (spare !== null) { const v = spare; spare = null; return v; }
+      let u = 0, v = 0; while (u === 0) u = rng(); v = rng();
+      const m = Math.sqrt(-2 * Math.log(u));
+      spare = m * Math.sin(2 * Math.PI * v);
+      return m * Math.cos(2 * Math.PI * v);
+    };
+  }
+
+  // Tape hiss shaped to the reference noise; returns a generator of [l, r] pairs at
+  // the requested RMS (per channel).
+  function makeTapeHiss(sampleRate, rms, seed) {
+    const g = makeGauss(makeRng(seed));
+    // pink base (flat per third-octave, like the reference), then the reference's tilt
+    function shaper() {
+      let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;   // Paul Kellet pinking
+      const f = [
+        makeBiquad('highpass', 25, sampleRate, 0.707),
+        makeBiquad('lowshelf', 200, sampleRate, 0.7, -4),
+        makeBiquad('peaking', 6500, sampleRate, 0.7, 3.5),
+        makeBiquad('lowpass', 13000, sampleRate, 0.6),
+        makeBiquad('lowpass', 15500, sampleRate, 0.9),
+      ];
+      return function (w) {
+        b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759;
+        b2 = 0.96900 * b2 + w * 0.1538520; b3 = 0.86650 * b3 + w * 0.3104856;
+        b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+        let x = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362; b6 = w * 0.115926;
+        for (let k = 0; k < f.length; k++) x = f[k](x);
+        return x;
+      };
+    }
+    const sm = shaper(), ss = shaper();
+    const side = 0.123;                 // mid/side mix: L/R correlation (1-s^2)/(1+s^2) ~0.97
+    // calibrate the shaped noise to unit RMS once (measured on a 2 s burst)
+    const cal = (function () {
+      const t = shaper(), tg = makeGauss(makeRng(seed ^ 0x9e3779b9));
+      let e = 0; const m = Math.round(sampleRate * 2);
+      for (let i = 0; i < m; i++) { const v = t(tg()); if (i > 2000) e += v * v; }
+      return 1 / Math.sqrt(e / (m - 2001));
+    })();
+    const k = rms * cal / Math.sqrt(1 + side * side);
+    // Filtering every sample costs ~10 s per 6-minute track, so the hiss is rendered once
+    // into two seamless loops of incommensurate length (7.31 s and 11.93 s, crossfaded
+    // seams) that are summed at 1/sqrt(2) each: same spectrum and level, and the
+    // combined pattern only repeats every ~87 s.
+    function renderLoop(seconds) {
+      const len = Math.round(seconds * sampleRate), fade = Math.round(0.05 * sampleRate), warm = 4096;
+      const tot = warm + len + fade, L = new Float32Array(len), R = new Float32Array(len);
+      const tl = new Float32Array(tot), tr = new Float32Array(tot);
+      for (let i = 0; i < tot; i++) { const m = sm(g()), d = side * ss(g()); tl[i] = (m + d) * k; tr[i] = (m - d) * k; }
+      for (let i = 0; i < len; i++) {
+        const j = warm + i;
+        if (i < fade) {             // fold the extra tail over the head: seamless wrap
+          const x = i / fade, a = Math.sqrt(x), b = Math.sqrt(1 - x);
+          L[i] = tl[j] * a + tl[j + len] * b; R[i] = tr[j] * a + tr[j + len] * b;
+        } else { L[i] = tl[j]; R[i] = tr[j]; }
+      }
+      return { L: L, R: R, len: len };
+    }
+    const A = renderLoop(7.31), B = renderLoop(11.93), h = Math.SQRT1_2;
+    let ia = 0, ib = 0;
+    return function () {
+      const o = [(A.L[ia] + B.L[ib]) * h, (A.R[ia] + B.R[ib]) * h];
+      if (++ia === A.len) ia = 0; if (++ib === B.len) ib = 0;
+      return o;
+    };
+  }
+
   function tapeStage(left, right, sampleRate) {
     const n = left.length;
     const outL = new Float32Array(n);
     const outR = new Float32Array(n);
+    const rng = makeRng(0x7A9E5EED);
 
-    // ---- tonal shaping ----
-    // LF warmth hump: tape playback eq adds a gentle bass-warmth.
-    // IMPORTANT: applied AFTER saturation so we don't overdrive the low end.
-    const lfBoostL = makeBiquad('peaking', 80, sampleRate, 0.8, 1.8);
-    const lfBoostR = makeBiquad('peaking', 80, sampleRate, 0.8, 1.8);
-    // Upper-mid presence: the "cassette" 3-5kHz bump
-    const presL = makeBiquad('peaking', 3800, sampleRate, 0.9, 1.8);
-    const presR = makeBiquad('peaking', 3800, sampleRate, 0.9, 1.8);
-    // HF rolloff: tape doesn't capture ultra-high freq well (~10kHz)
-    const hfRollL = makeBiquad('highshelf', 10000, sampleRate, 0.75, -5.5);
-    const hfRollR = makeBiquad('highshelf', 10000, sampleRate, 0.75, -5.5);
+    // programme RMS (whole input) for the hiss level
+    let e = 0; for (let i = 0; i < n; i++) e += left[i] * left[i] + right[i] * right[i];
+    const progRms = Math.sqrt(e / Math.max(1, 2 * n));
+    const hiss = progRms > 1e-6 ? makeTapeHiss(sampleRate, progRms * dbToLin(-TAPE_HISS_BELOW_RMS_DB), 0x51A5) : null;
 
-    // ---- tape saturation transfer function ----
-    // Single-stage gentle saturation with tube-like even-harmonic character.
-    // v2 had TWO cascaded tanh stages (oxide 1.8 + tube 1.4) which was too heavy
-    // on bass — anything with energy below 150Hz hit both non-linearities and
-    // came out crunchy/overloaded. Now: one moderate tanh + a small 2nd-harmonic
-    // bias, gentler drive (1.35 instead of 1.8+1.4 cascaded).
-    const satDrive = 1.35;
-    const satTanh = Math.tanh(satDrive);
-    function tapeSat(x) {
-      const s = Math.tanh(x * satDrive) / satTanh;
-      const even = 0.05 * s * s * Math.sign(s); // tube-like 2nd harmonic
-      return s + even;
-    }
+    // ---- saturation with level-relative drive and low-end emphasis ----
+    const emphL = makeBiquad('lowshelf', 150, sampleRate, 0.7, TAPE_LOW_EMPH_DB);
+    const emphR = makeBiquad('lowshelf', 150, sampleRate, 0.7, TAPE_LOW_EMPH_DB);
+    const deL = makeBiquad('lowshelf', 150, sampleRate, 0.7, -TAPE_LOW_EMPH_DB);
+    const deR = makeBiquad('lowshelf', 150, sampleRate, 0.7, -TAPE_LOW_EMPH_DB);
+    const rmsCoef = Math.exp(-1 / (sampleRate * 0.3));
+    let ms = progRms * progRms + 1e-12;
+    // The reference keeps its crest factor (13.5 -> 14.8 dB), so on attacks the
+    // saturation steps aside (same transient guard as the processing levels).
+    const guard = makeTransientGuard(sampleRate);
 
-    // ---- tape compression (program-dependent) ----
-    const compAttCoef = Math.exp(-1 / (sampleRate * 0.005));  // 5ms attack
-    const compRelCoef = Math.exp(-1 / (sampleRate * 0.18));   // 180ms release
-    const compThresh = 0.42;
-    const compRatio = 2.8;
-    let compEnv = 0;
+    // ---- gentle soft-knee compression (warmth), relative to the programme level ----
+    const compThrDb = linToDb(progRms) + 6;   // only the louder passages
+    const compRatio = 1.5, compKneeDb = 8;
+    const cAtt = Math.exp(-1 / (sampleRate * 0.03)), cRel = Math.exp(-1 / (sampleRate * 0.3));
+    let cEnv = 0, cGain = 1;
 
-    // ---- flutter: ORGANIC and clearly audible ----
-    // v2 was too subtle (depths halved too far, jumps too rare).
-    // v3: moderate base depths, MORE FREQUENT random bursts (every 6-15s instead
-    // of 20-50s), wider depth-mod range (0.3-1.2 instead of 0.2-0.8), and the
-    // slow wow is slightly faster (0.4Hz) for more perceptible pitch drift.
-    const maxFlutter = Math.ceil(sampleRate * 0.008); // 8ms max delay buffer
-    const fBufL = new Float32Array(maxFlutter + 2);
-    const fBufR = new Float32Array(maxFlutter + 2);
-    let fWrite = 0;
+    // ---- tone ----
+    const lowL = makeBiquad('lowshelf', 110, sampleRate, 0.7, 1.0), lowR = makeBiquad('lowshelf', 110, sampleRate, 0.7, 1.0);
+    const midL = makeBiquad('peaking', 500, sampleRate, 0.7, -0.5), midR = makeBiquad('peaking', 500, sampleRate, 0.7, -0.5);
+    const topL = makeBiquad('lowpass', 13500, sampleRate, 0.6), topR = makeBiquad('lowpass', 13500, sampleRate, 0.6);
 
-    // LFOs
-    let fPhase1 = Math.random() * 2 * Math.PI; // wow (0.4Hz — noticeable slow drift)
-    let fPhase2 = Math.random() * 2 * Math.PI; // flutter (1.6Hz — gentle warble)
-    const fInc1 = 2 * Math.PI * 0.4 / sampleRate;
-    const fInc2 = 2 * Math.PI * 1.6 / sampleRate;
+    // ---- wow & flutter: drifting sinusoids in the speed domain -> variable delay ----
+    const comps = TAPE_WOW.map(function (c) {
+      const ph = rng() * 2 * Math.PI;
+      return { f: c[0], amp: c[1] * Math.SQRT2 * TAPE_WOW_DEPTH, s: Math.sin(ph), c: Math.cos(ph),
+               a: 1, aT: 1, df: 0, dfT: 0, rs: 0, rc: 1 };
+    });
+    function setRate(c) { const wv = 2 * Math.PI * (c.f + c.df) / sampleRate; c.rs = Math.sin(wv); c.rc = Math.cos(wv); }
+    comps.forEach(setRate);
+    const blk = 256; let blkCount = 0;
+    const slew = 1 - Math.exp(-blk / (sampleRate * 0.8)); // ~0.8 s glide of amplitude / rate
+    // The read point swings around a centre delay D (peak swing ~250 samples at depth
+    // 1.0); the stage runs D samples past the end and shifts the output back by D, so
+    // the effect adds no latency.
+    const maxDelay = 1024, D = maxDelay / 2, buf = maxDelay * 2;
+    const dL = new Float32Array(buf), dR = new Float32Array(buf);
+    let w = 0, delay = D;
+    const leak = 1 / (sampleRate * 4);  // keeps the integrated delay centred (~4 s)
 
-    // Random-walk depth modulator — breathes between "barely there" and "clearly heard"
-    let depthMod = 0.6;
-    let depthTarget = 0.6;
-    const depthSlew = 0.00015;
-    let depthUpdateCounter = 0;
+    for (let i = 0; i < n + D; i++) {
+      let l = i < n ? left[i] : 0, r = i < n ? right[i] : 0;
 
-    // Random bursts: capstan slip / pinch roller wobble.
-    // Fires more often (every 6-15s) and with stronger amplitude.
-    let jumpTimer = Math.floor(sampleRate * (6 + Math.random() * 9));
-    let jumpEnv = 0;
-    const jumpDecay = Math.exp(-1 / (sampleRate * 0.12)); // 120ms decay (longer, more noticeable)
+      // saturation (unity small-signal gain, level-relative drive)
+      ms = rmsCoef * ms + (1 - rmsCoef) * 0.5 * (l * l + r * r);
+      const kk = TAPE_SAT_DRIVE / Math.max(Math.sqrt(ms), progRms * 0.25, 1e-5);
+      const wet = 1 - TAPE_GUARD * guard(Math.max(Math.abs(l), Math.abs(r)));
+      const el = emphL(l), er = emphR(r);
+      l = deL(el + (Math.tanh(el * kk) / kk - el) * wet);
+      r = deR(er + (Math.tanh(er * kk) / kk - er) * wet);
 
-    // Base flutter depths — audible but not extreme
-    const baseWowDepth    = 0.0007 * sampleRate;  // ±0.07% (was 0.035%)
-    const baseFlutDepth   = 0.0003 * sampleRate;  // ±0.03% (was 0.015%)
-
-    // ---- hiss ----
-    // Bias noise: felt as tape "breath/air", not heard as obvious hiss.
-    // v1 was ~-35 dBFS (way too audible). v2: ~-52 dBFS — subliminal presence.
-    // High-passed at 6kHz so it only adds air/texture in the top octave.
-    const hissLevel = 0.0025; // ~-52 dBFS
-    const hissHpL = makeBiquad('highpass', 6000, sampleRate, 0.5);
-    const hissHpR = makeBiquad('highpass', 6000, sampleRate, 0.5);
-
-    // ---- crosstalk: intimate stereo image ----
-    const crosstalk = 0.035;
-
-    for (let i = 0; i < n; i++) {
-      let l = left[i], r = right[i];
-
-      // tape saturation FIRST on the raw signal (not bass-boosted — avoids LF overload)
-      l = tapeSat(l); r = tapeSat(r);
-
-      // tonal shaping AFTER saturation: warmth + presence + HF roll
-      l = hfRollL(presL(lfBoostL(l)));
-      r = hfRollR(presR(lfBoostR(r)));
-
-      // program-dependent tape compression
+      // compression
       const rect = Math.max(Math.abs(l), Math.abs(r));
-      compEnv = rect > compEnv
-        ? compEnv * compAttCoef + (1 - compAttCoef) * rect
-        : compEnv * compRelCoef + (1 - compRelCoef) * rect;
-      let compGain = 1.0;
-      if (compEnv > compThresh) {
-        const over = compEnv - compThresh;
-        const grDb = over * (1 - 1 / compRatio);
-        compGain = dbToLin(-grDb);
+      cEnv = rect > cEnv ? cAtt * cEnv + (1 - cAtt) * rect : cRel * cEnv + (1 - cRel) * rect;
+      if ((i & 31) === 0) cGain = dbToLin(-softKneeGrDb(linToDb(cEnv), compThrDb, compRatio, compKneeDb));
+      l *= cGain; r *= cGain;
+
+      // tone
+      l = topL(midL(lowL(l))); r = topR(midR(lowR(r)));
+
+      // speed deviation for this sample
+      if (++blkCount >= blk) {
+        blkCount = 0;
+        for (let k = 0; k < comps.length; k++) {
+          const c = comps[k];
+          if (rng() < 0.02) { c.aT = 0.55 + rng() * 0.9; c.dfT = (rng() - 0.5) * 0.3 * c.f; }
+          c.a += (c.aT - c.a) * slew; c.df += (c.dfT - c.df) * slew;
+          setRate(c);
+          const nrm = 1 / Math.sqrt(c.s * c.s + c.c * c.c); c.s *= nrm; c.c *= nrm; // keep unit length
+        }
       }
-      l *= compGain; r *= compGain;
-
-      // flutter: update depth modulator periodically
-      depthUpdateCounter++;
-      if (depthUpdateCounter >= 512) {
-        depthUpdateCounter = 0;
-        // frequently pick a new random target depth — wider range for more life
-        if (Math.random() < 0.15) depthTarget = 0.3 + Math.random() * 0.9; // 0.3..1.2 range
+      let dev = 0;
+      for (let k = 0; k < comps.length; k++) {
+        const c = comps[k];
+        dev += c.s * c.amp * c.a;
+        const s2 = c.s * c.rc + c.c * c.rs; c.c = c.c * c.rc - c.s * c.rs; c.s = s2;
       }
-      depthMod += (depthTarget - depthMod) * depthSlew * 512;
-      depthMod = clamp(depthMod, 0.15, 1.3);
+      // speed (1 + dev) => the read point lags by the integral of -dev
+      delay += -dev - (delay - D) * leak;
+      if (delay < 2) delay = 2; else if (delay > maxDelay - 2) delay = maxDelay - 2;
 
-      // jump event
-      jumpTimer--;
-      if (jumpTimer <= 0) {
-        jumpEnv = 0.8 + Math.random() * 0.5; // sudden jump depth
-        jumpTimer = Math.floor(sampleRate * (20 + Math.random() * 30));
+      dL[w] = l; dR[w] = r;
+      const rp = w - delay, ri = Math.floor(rp), fr = rp - ri;
+      const a0 = (ri + buf) % buf, a1 = (a0 + 1) % buf;
+      l = dL[a0] * (1 - fr) + dL[a1] * fr;
+      r = dR[a0] * (1 - fr) + dR[a1] * fr;
+      w = (w + 1) % buf;
+
+      if (i >= D) {
+        if (hiss) { const h = hiss(); l += h[0]; r += h[1]; }
+        outL[i - D] = l; outR[i - D] = r;
       }
-      jumpEnv *= jumpDecay;
-
-      // combine flutter sources
-      const wow    = Math.sin(fPhase1) * baseWowDepth * depthMod;
-      const flutter = Math.sin(fPhase2) * baseFlutDepth * depthMod;
-      const jump   = jumpEnv * baseWowDepth * 1.5;
-      const totalFlutter = wow + flutter + jump;
-      fPhase1 += fInc1; if (fPhase1 > 2 * Math.PI) fPhase1 -= 2 * Math.PI;
-      fPhase2 += fInc2; if (fPhase2 > 2 * Math.PI) fPhase2 -= 2 * Math.PI;
-
-      fBufL[fWrite] = l; fBufR[fWrite] = r;
-      const fDel = Math.max(0, totalFlutter);
-      const fInt = Math.floor(fDel); const fFrac = fDel - fInt;
-      const frA = (fWrite - fInt + maxFlutter) % maxFlutter;
-      const frB = (frA - 1 + maxFlutter) % maxFlutter;
-      l = fBufL[frA] * (1 - fFrac) + fBufL[frB] * fFrac;
-      r = fBufR[frA] * (1 - fFrac) + fBufR[frB] * fFrac;
-      fWrite = (fWrite + 1) % maxFlutter;
-
-      // hiss (subtle, felt not heard)
-      const noise = (Math.random() * 2 - 1) * hissLevel;
-      const noiseR = (Math.random() * 2 - 1) * hissLevel;
-      l += hissHpL(noise);
-      r += hissHpR(noiseR);
-
-      // crosstalk
-      const lOld = l;
-      l = l * (1 - crosstalk) + r * crosstalk;
-      r = r * (1 - crosstalk) + lOld * crosstalk;
-
-      outL[i] = l;
-      outR[i] = r;
     }
     return { left: outL, right: outR };
   }
@@ -2607,7 +2651,7 @@
     processAudio, processAudioAsync, previewAnalysis,
     analyzeSource, classifySource, densityScore, measureLUFS,
     measureBandBalance, buildAdaptiveTonalMoves, spectralFeatures,
-    GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb,
+    GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb, makeTapeHiss, tapeStage,
   };
 });
 
