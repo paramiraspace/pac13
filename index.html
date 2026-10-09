@@ -949,6 +949,24 @@
     };
   }
 
+  // Level-aware saturation drive (processing levels). Real music sits 12-18 dB below its
+  // peaks, so a curve tuned on peaks barely touches it. This follows the programme RMS
+  // (~300 ms) and returns the input gain k that brings it up to LEVEL_DRIVE_RMS_DB before
+  // the curve; the wet signal is divided by k again, so loudness is untouched and only
+  // the harmonic density follows the music. k never goes below 1 (never less colour).
+  const LEVEL_DRIVE_RMS_DB = -8;
+  const LEVEL_DRIVE_MAX = 6;
+  function makeLevelDrive(sampleRate) {
+    const coef = Math.exp(-1 / (sampleRate * 0.3));
+    const target = Math.pow(10, LEVEL_DRIVE_RMS_DB / 20);
+    let ms = target * target;
+    return function (l, r) {
+      ms = coef * ms + (1 - coef) * 0.5 * (l * l + r * r);
+      const k = target / Math.sqrt(ms + 1e-12);
+      return k < 1 ? 1 : (k > LEVEL_DRIVE_MAX ? LEVEL_DRIVE_MAX : k);
+    };
+  }
+
   // ---------------- K-weighting (ITU-R BS.1770-style) + integrated LUFS ----------------
   // Filter design values below are the standard analog-prototype parameters used to
   // redesign the BS.1770 K-weighting filters at arbitrary sample rates (stage 1: high
@@ -1335,10 +1353,12 @@
     }
     const guardDepth = params.transientGuard || 0;
     const guard = guardDepth > 0 ? makeTransientGuard(params.sampleRate) : null;
+    const levelDrive = params.levelDrive ? makeLevelDrive(params.sampleRate) : null;
     for (let i = 0; i < left.length; i++) {
       const dl = left[i], dr = right[i];
-      const wl = sat(lowShelfL(dl));
-      const wr = sat(lowShelfR(dr));
+      const k = levelDrive ? levelDrive(dl, dr) : 1;
+      const wl = sat(lowShelfL(dl) * k) / k;
+      const wr = sat(lowShelfR(dr) * k) / k;
       const m = guard ? mix * (1 - guardDepth * guard(Math.max(Math.abs(dl), Math.abs(dr)))) : mix;
       left[i] = dl * (1 - m) + wl * m;
       right[i] = dr * (1 - m) + wr * m;
@@ -1677,9 +1697,11 @@
 
     const guardDepth = params.transientGuard || 0;
     const guard = guardDepth > 0 ? makeTransientGuard(params.sampleRate) : null;
+    const levelDrive = params.levelDrive ? makeLevelDrive(params.sampleRate) : null;
     for (let i = 0; i < n; i++) {
       const dl = left[i], dr = right[i];
-      const wl = tube(dl), wr = tube(dr);
+      const k = levelDrive ? levelDrive(dl, dr) : 1;
+      const wl = tube(dl * k) / k, wr = tube(dr * k) / k;
       const m = guard ? wetDry * (1 - guardDepth * guard(Math.max(Math.abs(dl), Math.abs(dr)))) : wetDry;
       outL[i] = dl * (1 - m) + wl * m;
       outR[i] = dr * (1 - m) + wr * m;
@@ -2214,7 +2236,9 @@
     // "already loud/wide" detection for EDM: a finished, hot master (near/above 0 dBFS,
     // loud integrated LUFS). When true, we pre-attenuate before processing so the chain
     // has clean headroom and the final limiter can re-establish a controlled ceiling.
-    const isHotMaster = (originalLufs > -10) || (metrics.peakDb > -0.3);
+    // A peak near 0 dBFS alone doesn't make a finished loud master: a dynamic -15 LUFS
+    // track with one full-scale hit was being treated as one and turned DOWN in Light.
+    const isHotMaster = (originalLufs > -10) || (metrics.peakDb > -0.3 && originalLufs > -12);
     const edmPreAttenDb = (isEDM && isHotMaster) ? -3.0 : 0.0;
 
     // meta accumulators filled in as stages run
@@ -2238,7 +2262,9 @@
     // EDM target: for a genuinely hot master (isHotMaster) land ~0.5 LU below the source
     // (declip + tame); for a NON-hot source loaded in EDM mode, normalize up to a loud
     // -10 like any other genre so quiet EDM material still gets louder.
-    const edmTarget = isHotMaster ? (originalLufs - 0.5) : -10;
+    // Light (edm profile) is the gentlest level, so on a non-hot source it is also the
+    // quietest target (-12.5); at -10 it pushed dynamic tracks hardest of all levels.
+    const edmTarget = isHotMaster ? (originalLufs - 0.5) : -12.5;
     // Firm loudness targets. Soul/Funk (Strong) aims for -11.5 LUFS: still the loudest
     // level, but at -11 the -1 dBTP ceiling left it ~1 dB less crest than Medium and it
     // read as less clear. The output is always driven fully to these unless the source
@@ -2270,7 +2296,7 @@
     }});
 
     steps.push({ pct: 20, run: function () {
-      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel });
+      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel });
       left = r1.left; right = r1.right;
     }});
 
@@ -2298,7 +2324,10 @@
         let r3 = multibandStage(left, right, {
           sampleRate: sampleRate, intensityScale: intensityScale,
           lowBandRatioMult: genre.lowBandRatioMult, lowBandThreshAdjustDb: genre.lowBandThreshAdjustDb,
-          bandGainDb: genre.mbBandGainDb, complementary: hasLevel,
+          // Levels: no per-band trims. They tilted the mix darker (~-0.7 dB at 1.8 kHz on a
+          // real track) and, applied to the complementary bands, re-introduced crossover
+          // phase into the sum. Tonal balance is now the optional tonal style's job.
+          bandGainDb: hasLevel ? [0, 0, 0] : genre.mbBandGainDb, complementary: hasLevel,
         });
         left = r3.left; right = r3.right;
       }});
@@ -2316,7 +2345,7 @@
     if (!isEDM && !isCharacterMode) {
       steps.push({ pct: 76, run: function () {
         let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * colourScale * (hasLevel ? LEVEL_WARMTH_BOOST : 1),
-          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel });
+          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel });
         left = r4.left; right = r4.right;
         meta.kazrogMakeupGainDb = r4.makeupGainDb;
       }});
