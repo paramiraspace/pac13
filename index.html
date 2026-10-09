@@ -1785,119 +1785,6 @@
   }
 
   // ============================================================
-  //  VINYL EMULATION STAGE
-  //  Models the character of playing audio through a vinyl record
-  //  and turntable. All parameters tuned for "clearly audible"
-  //  (user requested "выраженный" effect, not subtle).
-  //
-  //  What it does, in signal-chain order:
-  //  1. RIAA-style tonal curve: soft cut ~100–300Hz (hollow muddy
-  //     resonance of the cutting lathe), gentle presence lift
-  //     ~3–6kHz (needle/cartridge resonance), roll off above 12kHz.
-  //  2. Wow & flutter: two LFOs (slow wow 0.7Hz / faster flutter
-  //     2.5Hz) that pitch-modulate via a short variable-delay line.
-  //  3. Crackle & pops: band-limited noise bursts at random
-  //     intervals, shaped to sound like dust/scratches.
-  //  4. Soft saturation: gentle even-harmonic distortion that a
-  //     cheap cartridge and phono preamp introduce.
-  //  5. Stereo narrowing at low end (cutting limitation).
-  //  6. Output trim to unity (vinyl is louder-feeling due to crackle
-  //     but we don't want actual loudness change).
-  // ============================================================
-  function vinylStage(left, right, sampleRate) {
-    const n = left.length;
-    const outL = new Float32Array(n);
-    const outR = new Float32Array(n);
-
-    // 1. RIAA-ish tonal shaping (pre-emphasis for "vinyl" character)
-    const loShelfL = makeBiquad('lowshelf', 180, sampleRate, 0.7, -2.8);
-    const loShelfR = makeBiquad('lowshelf', 180, sampleRate, 0.7, -2.8);
-    const presL = makeBiquad('peaking', 4200, sampleRate, 1.1, 2.2);
-    const presR = makeBiquad('peaking', 4200, sampleRate, 1.1, 2.2);
-    const hiCutL = makeBiquad('highshelf', 11000, sampleRate, 0.8, -5.5);
-    const hiCutR = makeBiquad('highshelf', 11000, sampleRate, 0.8, -5.5);
-
-    // 2. Wow & flutter via a short variable-delay interpolation
-    //    Max delay corresponds to ±0.25% pitch deviation for wow,
-    //    ±0.12% for flutter — "clearly audible" per the brief.
-    const maxDelaySamples = Math.ceil(sampleRate * 0.005); // 5ms buffer
-    const delayBufL = new Float32Array(maxDelaySamples + 2);
-    const delayBufR = new Float32Array(maxDelaySamples + 2);
-    let delayWrite = 0;
-    const wowHz = 0.7, flutterHz = 2.5;
-    const wowDepth = 0.0025 * sampleRate;   // samples of depth
-    const flutterDepth = 0.0012 * sampleRate;
-    let wowPhase = 0, flutterPhase = 0;
-    const wowInc = 2 * Math.PI * wowHz / sampleRate;
-    const flutterInc = 2 * Math.PI * flutterHz / sampleRate;
-
-    // 3. Crackle state
-    let crackleTimer = Math.floor(sampleRate * (0.3 + Math.random() * 0.8));
-    let crackleDecay = 0, crackleAmpL = 0, crackleAmpR = 0;
-    const crackleEnvCoef = Math.exp(-1 / (sampleRate * 0.004)); // 4ms decay
-    // Band-limited crackle: two poles around 3-7kHz
-    const crackBpL = makeBiquad('peaking', 5000, sampleRate, 1.5, 8);
-    const crackBpR = makeBiquad('peaking', 5000, sampleRate, 1.5, 8);
-
-    // 5. Low-end mono-izer (cutting limitation below 120Hz)
-    const monoLpL = makeBiquad('lowpass', 120, sampleRate, 0.7);
-    const monoLpR = makeBiquad('lowpass', 120, sampleRate, 0.7);
-
-    for (let i = 0; i < n; i++) {
-      let l = left[i], r = right[i];
-
-      // 1. Tonal shaping
-      l = hiCutL(presL(loShelfL(l)));
-      r = hiCutR(presR(loShelfR(r)));
-
-      // 2. Wow & flutter
-      const wobble = Math.sin(wowPhase) * wowDepth + Math.sin(flutterPhase) * flutterDepth;
-      wowPhase += wowInc; if (wowPhase > 2 * Math.PI) wowPhase -= 2 * Math.PI;
-      flutterPhase += flutterInc; if (flutterPhase > 2 * Math.PI) flutterPhase -= 2 * Math.PI;
-      delayBufL[delayWrite] = l;
-      delayBufR[delayWrite] = r;
-      const delaySamples = Math.max(0, wobble);
-      const delayInt = Math.floor(delaySamples);
-      const frac = delaySamples - delayInt;
-      const rA = (delayWrite - delayInt + maxDelaySamples) % maxDelaySamples;
-      const rB = (rA - 1 + maxDelaySamples) % maxDelaySamples;
-      l = delayBufL[rA] * (1 - frac) + delayBufL[rB] * frac;
-      r = delayBufR[rA] * (1 - frac) + delayBufR[rB] * frac;
-      delayWrite = (delayWrite + 1) % maxDelaySamples;
-
-      // 3. Crackle & pops
-      crackleTimer--;
-      if (crackleTimer <= 0) {
-        // spawn a new crack — amplitude 0.06-0.18, duration 1-4ms
-        crackleAmpL = (0.06 + Math.random() * 0.12) * (Math.random() > 0.5 ? 1 : -1);
-        crackleAmpR = crackleAmpL * (0.7 + Math.random() * 0.3);
-        crackleDecay = 1.0;
-        crackleTimer = Math.floor(sampleRate * (0.2 + Math.random() * 0.9));
-      }
-      if (crackleDecay > 1e-4) {
-        const cn = (Math.random() * 2 - 1);
-        l += crackBpL(cn * crackleAmpL * crackleDecay);
-        r += crackBpR(cn * crackleAmpR * crackleDecay);
-        crackleDecay *= crackleEnvCoef;
-      }
-
-      // 4. Soft even-harmonic saturation (cartridge/preamp character)
-      const drive = 1.35;
-      l = Math.tanh(l * drive) / Math.tanh(drive);
-      r = Math.tanh(r * drive) / Math.tanh(drive);
-
-      // 5. Low-end mono (cutting limitation)
-      const monoLow = (monoLpL(l) + monoLpR(r)) * 0.5;
-      l = l - monoLpL(l) * 0.5 + monoLow * 0.5;
-      r = r - monoLpR(r) * 0.5 + monoLow * 0.5;
-
-      outL[i] = l;
-      outR[i] = r;
-    }
-    return { left: outL, right: outR };
-  }
-
-  // ============================================================
   //  TAPE / VHS EMULATION STAGE — v4 (calibrated on the user's references)
   //  Reference set (Oct 2026): a 30 s track exported clean and through the user's
   //  tape chain, a 984 Hz tone through it, and 30 s of the tape's own noise.
@@ -2006,26 +1893,29 @@
     };
   }
 
-  function tapeStage(left, right, sampleRate) {
+  // ---------------- shared character engine (Tape / VHS and Vinyl) ----------------
+  // Per sample: saturation (level-relative drive, lows pre-emphasised, attacks bypass it)
+  // -> gentle soft-knee compression -> tone filters -> optional mono low end ->
+  // wow & flutter (drifting sinusoids in the speed domain driving a variable delay,
+  // latency-compensated) -> the medium's noise. Seeded, so renders are repeatable.
+  function characterStage(left, right, sampleRate, cfg) {
     const n = left.length;
     const outL = new Float32Array(n);
     const outR = new Float32Array(n);
-    const rng = makeRng(0x7A9E5EED);
+    const rng = makeRng(cfg.seed);
 
-    // programme RMS (whole input) for the hiss level
+    // programme RMS (whole input) for the noise level and the compressor threshold
     let e = 0; for (let i = 0; i < n; i++) e += left[i] * left[i] + right[i] * right[i];
     const progRms = Math.sqrt(e / Math.max(1, 2 * n));
-    const hiss = progRms > 1e-6 ? makeTapeHiss(sampleRate, progRms * dbToLin(-TAPE_HISS_BELOW_RMS_DB), 0x51A5) : null;
+    const noise = progRms > 1e-6 ? cfg.noise(sampleRate, progRms) : null;
 
     // ---- saturation with level-relative drive and low-end emphasis ----
-    const emphL = makeBiquad('lowshelf', 150, sampleRate, 0.7, TAPE_LOW_EMPH_DB);
-    const emphR = makeBiquad('lowshelf', 150, sampleRate, 0.7, TAPE_LOW_EMPH_DB);
-    const deL = makeBiquad('lowshelf', 150, sampleRate, 0.7, -TAPE_LOW_EMPH_DB);
-    const deR = makeBiquad('lowshelf', 150, sampleRate, 0.7, -TAPE_LOW_EMPH_DB);
+    const emphL = makeBiquad('lowshelf', 150, sampleRate, 0.7, cfg.lowEmphDb);
+    const emphR = makeBiquad('lowshelf', 150, sampleRate, 0.7, cfg.lowEmphDb);
+    const deL = makeBiquad('lowshelf', 150, sampleRate, 0.7, -cfg.lowEmphDb);
+    const deR = makeBiquad('lowshelf', 150, sampleRate, 0.7, -cfg.lowEmphDb);
     const rmsCoef = Math.exp(-1 / (sampleRate * 0.3));
     let ms = progRms * progRms + 1e-12;
-    // The reference keeps its crest factor (13.5 -> 14.8 dB), so on attacks the
-    // saturation steps aside (same transient guard as the processing levels).
     const guard = makeTransientGuard(sampleRate);
 
     // ---- gentle soft-knee compression (warmth), relative to the programme level ----
@@ -2034,24 +1924,23 @@
     const cAtt = Math.exp(-1 / (sampleRate * 0.03)), cRel = Math.exp(-1 / (sampleRate * 0.3));
     let cEnv = 0, cGain = 1;
 
-    // ---- tone ----
-    const lowL = makeBiquad('lowshelf', 110, sampleRate, 0.7, 1.0), lowR = makeBiquad('lowshelf', 110, sampleRate, 0.7, 1.0);
-    const midL = makeBiquad('peaking', 500, sampleRate, 0.7, -0.5), midR = makeBiquad('peaking', 500, sampleRate, 0.7, -0.5);
-    const topL = makeBiquad('lowpass', 13500, sampleRate, 0.6), topR = makeBiquad('lowpass', 13500, sampleRate, 0.6);
+    // ---- tone (+ optional mono low end) ----
+    const toneL = cfg.tone(sampleRate), toneR = cfg.tone(sampleRate);
+    const monoL = cfg.monoBelowHz ? makeCrossoverLP(cfg.monoBelowHz, sampleRate) : null;
+    const monoR = cfg.monoBelowHz ? makeCrossoverLP(cfg.monoBelowHz, sampleRate) : null;
 
     // ---- wow & flutter: drifting sinusoids in the speed domain -> variable delay ----
-    const comps = TAPE_WOW.map(function (c) {
+    const comps = cfg.wow.map(function (c) {
       const ph = rng() * 2 * Math.PI;
-      return { f: c[0], amp: c[1] * Math.SQRT2 * TAPE_WOW_DEPTH, s: Math.sin(ph), c: Math.cos(ph),
+      return { f: c[0], amp: c[1] * Math.SQRT2 * cfg.wowDepth, s: Math.sin(ph), c: Math.cos(ph),
                a: 1, aT: 1, df: 0, dfT: 0, rs: 0, rc: 1 };
     });
     function setRate(c) { const wv = 2 * Math.PI * (c.f + c.df) / sampleRate; c.rs = Math.sin(wv); c.rc = Math.cos(wv); }
     comps.forEach(setRate);
     const blk = 256; let blkCount = 0;
     const slew = 1 - Math.exp(-blk / (sampleRate * 0.8)); // ~0.8 s glide of amplitude / rate
-    // The read point swings around a centre delay D (peak swing ~250 samples at depth
-    // 1.0); the stage runs D samples past the end and shifts the output back by D, so
-    // the effect adds no latency.
+    // The read point swings around a centre delay D; the stage runs D samples past the
+    // end and shifts the output back by D, so the effect adds no latency.
     const maxDelay = 1024, D = maxDelay / 2, buf = maxDelay * 2;
     const dL = new Float32Array(buf), dR = new Float32Array(buf);
     let w = 0, delay = D;
@@ -2062,8 +1951,8 @@
 
       // saturation (unity small-signal gain, level-relative drive)
       ms = rmsCoef * ms + (1 - rmsCoef) * 0.5 * (l * l + r * r);
-      const kk = TAPE_SAT_DRIVE / Math.max(Math.sqrt(ms), progRms * 0.25, 1e-5);
-      const wet = 1 - TAPE_GUARD * guard(Math.max(Math.abs(l), Math.abs(r)));
+      const kk = cfg.satDrive / Math.max(Math.sqrt(ms), progRms * 0.25, 1e-5);
+      const wet = 1 - cfg.guard * guard(Math.max(Math.abs(l), Math.abs(r)));
       const el = emphL(l), er = emphR(r);
       l = deL(el + (Math.tanh(el * kk) / kk - el) * wet);
       r = deR(er + (Math.tanh(er * kk) / kk - er) * wet);
@@ -2075,7 +1964,11 @@
       l *= cGain; r *= cGain;
 
       // tone
-      l = topL(midL(lowL(l))); r = topR(midR(lowR(r)));
+      for (let k = 0; k < toneL.length; k++) { l = toneL[k](l); r = toneR[k](r); }
+      if (monoL) {
+        const lo = monoL(l), ro = monoR(r), mo = (lo + ro) * 0.5;
+        l = l - lo + mo; r = r - ro + mo;
+      }
 
       // speed deviation for this sample
       if (++blkCount >= blk) {
@@ -2106,11 +1999,148 @@
       w = (w + 1) % buf;
 
       if (i >= D) {
-        if (hiss) { const h = hiss(); l += h[0]; r += h[1]; }
+        if (noise) { const h = noise(); l += h[0]; r += h[1]; }
         outL[i - D] = l; outR[i - D] = r;
       }
     }
     return { left: outL, right: outR };
+  }
+
+  function tapeStage(left, right, sampleRate) {
+    return characterStage(left, right, sampleRate, {
+      seed: 0x7A9E5EED, wow: TAPE_WOW, wowDepth: TAPE_WOW_DEPTH,
+      satDrive: TAPE_SAT_DRIVE, lowEmphDb: TAPE_LOW_EMPH_DB, guard: TAPE_GUARD,
+      tone: function (sr) {
+        return [makeBiquad('lowshelf', 110, sr, 0.7, 1.0), makeBiquad('peaking', 500, sr, 0.7, -0.5),
+                makeBiquad('lowpass', 13500, sr, 0.6)];
+      },
+      monoBelowHz: 0,
+      noise: function (sr, progRms) { return makeTapeHiss(sr, progRms * dbToLin(-TAPE_HISS_BELOW_RMS_DB), 0x51A5); },
+    });
+  }
+
+  // ============================================================
+  //  VINYL EMULATION STAGE — v2
+  //  Noise calibrated on the user's vinyl noise recording (45 s, Oct 2026):
+  //   - surface noise mostly in the vertical (L-R) component: L/R correlation -0.29,
+  //     side 2.6 dB above mid; background (between clicks) -70.7 dBFS RMS, roughly
+  //     flat per third-octave with a little low-end weight
+  //   - crackle: very short clicks (~0.2 ms), Poisson-like, peak-count curve per second
+  //     565 > -60, 145 > -50, 65 > -45, 28 > -40, 10 > -35, 3.9 > -30, 0.7 > -25 dBFS
+  //     (a broken power law), usually louder in one channel, opposite polarity 2/3 of
+  //     the time; bright (+4..+7 dB at 1.6-8 kHz vs 1 kHz), rolling off above 12.5 kHz
+  //   - levels are kept relative to the programme as if it sat at -15 dBFS RMS (the
+  //     level of the user's tape reference track; no vinyl track was supplied)
+  //  Playback character (no vinyl track/tone reference yet -- typical values and the
+  //  user's brief: light distortion, warm saturated lows, gentle compression):
+  //   - wow ~0.08 % RMS at the 33 1/3 rpm rotation (0.555 Hz) plus a little flutter
+  //   - saturation lighter than tape, lows pre-emphasised, attacks bypass it
+  //   - tone: +1 dB below ~120 Hz, -2 dB shelf above 11 kHz, mono below 120 Hz
+  // ============================================================
+  const VINYL_WOW = [[0.555, 0.0008], [1.11, 0.0003], [8.0, 0.0002]];
+  const VINYL_WOW_DEPTH = 1.0;
+  const VINYL_SAT_DRIVE = 0.25;
+  const VINYL_REF_PROG_RMS_DB = -15;    // programme level the noise recording is relative to
+
+  // Vinyl surface noise + crackle. Background: two seamless loops (as the tape hiss).
+  // Crackle: generated live (a looped pop would audibly repeat), each click a scaled
+  // copy of a short band-shaped kernel, panned and polarity-flipped at random.
+  function makeVinylNoise(sampleRate, progRms, seed) {
+    const scale = progRms / dbToLin(VINYL_REF_PROG_RMS_DB);
+    const rng = makeRng(seed), g = makeGauss(makeRng(seed ^ 0x2545F491));
+    // ---- background surface noise (pink-based, mid/side with side > mid) ----
+    function shaper() {
+      let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+      const f = [
+        makeBiquad('highpass', 30, sampleRate, 0.707),
+        makeBiquad('lowshelf', 110, sampleRate, 0.7, 0),
+        makeBiquad('lowpass', 15000, sampleRate, 0.5),
+      ];
+      return function (w) {
+        b0 = 0.99886 * b0 + w * 0.0555179; b1 = 0.99332 * b1 + w * 0.0750759;
+        b2 = 0.96900 * b2 + w * 0.1538520; b3 = 0.86650 * b3 + w * 0.3104856;
+        b4 = 0.55000 * b4 + w * 0.5329522; b5 = -0.7616 * b5 - w * 0.0168980;
+        let x = b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362; b6 = w * 0.115926;
+        for (let k = 0; k < f.length; k++) x = f[k](x);
+        return x;
+      };
+    }
+    const sm = shaper(), ss = shaper(), side = 1.6;   // background corr (1-s^2)/(1+s^2) ~ -0.44
+    const cal = (function () {
+      const t = shaper(), tg = makeGauss(makeRng(seed ^ 0x9e3779b9));
+      let e = 0; const m = Math.round(sampleRate * 2);
+      for (let i = 0; i < m; i++) { const v = t(tg()); if (i > 2000) e += v * v; }
+      return 1 / Math.sqrt(e / (m - 2001));
+    })();
+    const bgK = dbToLin(VINYL_BG_RMS_DB) * scale * cal / Math.sqrt(1 + side * side);
+    function renderLoop(seconds) {
+      const len = Math.round(seconds * sampleRate), fade = Math.round(0.05 * sampleRate), warm = 4096;
+      const tot = warm + len + fade, L = new Float32Array(len), R = new Float32Array(len);
+      const tl = new Float32Array(tot), tr = new Float32Array(tot);
+      for (let i = 0; i < tot; i++) { const m = sm(g()), d = side * ss(g()); tl[i] = (m + d) * bgK; tr[i] = (m - d) * bgK; }
+      for (let i = 0; i < len; i++) {
+        const j = warm + i;
+        if (i < fade) {
+          const x = i / fade, a = Math.sqrt(x), b = Math.sqrt(1 - x);
+          L[i] = tl[j] * a + tl[j + len] * b; R[i] = tr[j] * a + tr[j + len] * b;
+        } else { L[i] = tl[j]; R[i] = tr[j]; }
+      }
+      return { L: L, R: R, len: len };
+    }
+    const A = renderLoop(7.31), B = renderLoop(11.93), h = Math.SQRT1_2;
+    let ia = 0, ib = 0;
+
+    // ---- crackle kernel: impulse through the measured brightness, peak-normalised ----
+    const KL = 48, kernel = new Float32Array(KL);
+    (function () {
+      const hp = makeBiquad('highpass', VINYL_CLICK_HP_HZ, sampleRate, 0.6), lp = makeBiquad('lowpass', VINYL_CLICK_LP_HZ, sampleRate, 0.6);
+      let pk = 0;
+      for (let i = 0; i < KL; i++) { kernel[i] = lp(hp(i === 0 ? 1 : 0)); pk = Math.max(pk, Math.abs(kernel[i])); }
+      for (let i = 0; i < KL; i++) kernel[i] /= pk;
+    })();
+    const ringL = new Float32Array(KL), ringR = new Float32Array(KL); let rp = 0;
+    const pClick = VINYL_CLICK_RATE / sampleRate;
+    const aMin = dbToLin(VINYL_CLICK_MIN_DB) * scale, aKnee = dbToLin(VINYL_CLICK_KNEE_DB) * scale;
+    const aMax = dbToLin(VINYL_CLICK_MAX_DB) * scale;
+    const pHigh = VINYL_CLICK_HIGH_SHARE;
+    // truncated Pareto between aMin and aKnee (slope 1.25), Pareto above aKnee (slope 2.0)
+    const lowA = Math.pow(aMin, -1.25), lowB = Math.pow(aKnee, -1.25);
+
+    return function () {
+      if (rng() < pClick) {
+        let amp;
+        if (rng() < pHigh) amp = Math.min(aKnee * Math.pow(1 - rng(), -1 / VINYL_CLICK_HIGH_SLOPE), aMax);
+        else amp = Math.pow(lowA - rng() * (lowA - lowB), -1 / 1.25);
+        const th = rng() * Math.PI / 2;
+        const gl = Math.cos(th) * amp, gr = Math.sin(th) * amp * (rng() < 0.72 ? -1 : 1);
+        for (let k = 0; k < KL; k++) { const j = (rp + k) % KL; ringL[j] += kernel[k] * gl; ringR[j] += kernel[k] * gr; }
+      }
+      const o = [(A.L[ia] + B.L[ib]) * h + ringL[rp], (A.R[ia] + B.R[ib]) * h + ringR[rp]];
+      ringL[rp] = 0; ringR[rp] = 0; rp = (rp + 1) % KL;
+      if (++ia === A.len) ia = 0; if (++ib === B.len) ib = 0;
+      return o;
+    };
+  }
+  const VINYL_BG_RMS_DB = -66.0;        // background surface noise (calibrated: measures -70.7 between clicks)
+  const VINYL_CLICK_RATE = 900;         // generated clicks per second (calibrated to the measured peak counts)
+  const VINYL_CLICK_MIN_DB = -60;
+  const VINYL_CLICK_KNEE_DB = -45;      // power-law slope changes here (1.25 -> 2.0)
+  const VINYL_CLICK_MAX_DB = -21;
+  const VINYL_CLICK_HIGH_SHARE = 0.09;  // share of clicks above the knee
+  const VINYL_CLICK_HP_HZ = 1200;
+  const VINYL_CLICK_LP_HZ = 5500;
+  const VINYL_CLICK_HIGH_SLOPE = 2.0;
+
+  function vinylStage(left, right, sampleRate) {
+    return characterStage(left, right, sampleRate, {
+      seed: 0x5EED0FAB, wow: VINYL_WOW, wowDepth: VINYL_WOW_DEPTH,
+      satDrive: VINYL_SAT_DRIVE, lowEmphDb: 4, guard: 0.85,
+      tone: function (sr) {
+        return [makeBiquad('lowshelf', 120, sr, 0.7, 1.0), makeBiquad('highshelf', 11000, sr, 0.7, -2.0)];
+      },
+      monoBelowHz: 120,
+      noise: function (sr, progRms) { return makeVinylNoise(sr, progRms, 0x0C4AC1E); },
+    });
   }
 
 
@@ -2664,7 +2694,7 @@
     processAudio, processAudioAsync, previewAnalysis,
     analyzeSource, classifySource, densityScore, measureLUFS,
     measureBandBalance, buildAdaptiveTonalMoves, spectralFeatures,
-    GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb, makeTapeHiss, tapeStage,
+    GENRE_PROFILES, TONAL_STYLES, dbToLin, linToDb, makeTapeHiss, tapeStage, makeVinylNoise, vinylStage,
   };
 });
 
