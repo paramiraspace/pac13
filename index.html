@@ -1137,6 +1137,7 @@
     return { pow, binHz: sampleRate / N };
   }
   function bandEnergy(sp, lo, hi) { let e = 0; const a = Math.max(1, Math.round(lo / sp.binHz)), b = Math.min(sp.pow.length - 1, Math.round(hi / sp.binHz)); for (let k = a; k <= b; k++) e += sp.pow[k]; return e; }
+  function bandMean(sp, lo, hi) { const a = Math.max(1, Math.round(lo / sp.binHz)), b = Math.min(sp.pow.length - 1, Math.round(hi / sp.binHz)); return bandEnergy(sp, lo, hi) / Math.max(1, b - a + 1); }
   function dB(x) { return 10 * Math.log10(Math.max(x, 1e-20)); }
   function spectralFeatures(left, right, sampleRate) {
     const sp = averageSpectrum(left, right, sampleRate); if (!sp) return null;
@@ -1154,6 +1155,9 @@
       cutoffHz,
       presenceDb: dB(bandEnergy(sp, 2500, 5000)) - dB(mid),   // harshness indicator
       lowDb: dB(bandEnergy(sp, 40, 120)) - dB(mid),           // low-end weight
+      // deep lows vs the bass, and the bass vs the body (average level per FFT bin)
+      subDb: dB(bandMean(sp, 30, 55)) - dB(bandMean(sp, 65, 130)),
+      bassDb: dB(bandMean(sp, 65, 130)) - dB(bandMean(sp, 150, 400)),
     };
   }
 
@@ -2405,10 +2409,11 @@
   // plus a human-readable report for the UI. Thresholds were calibrated on pink noise, a
   // real EDM track (320k MP3 with a 15.75 kHz cutoff) and synthetic mixes.
   const THIN_LOW_DB = 6, BRIGHT_PRESENCE_DB = -6;
+  const SUB_TARGET_DB = 2, SUB_LIFT_PER_DB = 1.2, SUB_LIFT_MAX_DB = 5, SUB_LIFT_HZ = 42, SUB_LIFT_Q = 1.1;
 
   function adaptToSource(sp, metrics, originalLufs, targetLUFS, ceilingDb, genreKey, isHotMaster, targetForced) {
     const report = [];
-    const out = { genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, airScale: 1, correction: null, targetLUFS: targetLUFS, report: report };
+    const out = { genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, airScale: 1, correction: null, subLiftDb: 0, targetLUFS: targetLUFS, report: report };
     const plr = metrics.peakDb - originalLufs;
     report.push({ key: 'loudness', label: 'Loudness', value: originalLufs.toFixed(1) + ' LUFS, peak ' + metrics.peakDb.toFixed(1) + ' dBFS, dynamics (PLR) ' + plr.toFixed(1) + ' dB' });
     if (sp) {
@@ -2439,6 +2444,19 @@
       out.lowScale = 1 - 0.7 * boom;
       report.push({ key: 'low', label: 'Low end 40-120 Hz', value: (sp.lowDb >= 0 ? '+' : '') + sp.lowDb.toFixed(1) + ' dB vs mids' + (boom > 0.05 ? ' (heavy)' : ''),
         action: boom > 0.05 ? 'own bass boosts -' + Math.round(boom * 70) + '%' : null });
+
+      // Deep lows missing under a real bass line (older records, poor MP3s): the bass
+      // sits at 65-130 Hz but 30-55 Hz falls well below a pink-noise balance. Only when
+      // the bass is actually there (bass above the body), so thin sources without a
+      // bass line (the clean tape track, the thin + bright test) are left alone.
+      const subShort = SUB_TARGET_DB - sp.subDb;
+      const hasBass = clamp(sp.bassDb / 3, 0, 1);
+      const subLift = clamp(SUB_LIFT_PER_DB * (subShort - 1), 0, SUB_LIFT_MAX_DB) * hasBass;
+      if (subLift > 0.1) {
+        out.subLiftDb = subLift;
+        report.push({ key: 'sub', label: 'Deep lows 30-55 Hz', value: (sp.subDb >= 0 ? '+' : '') + sp.subDb.toFixed(1) + ' dB vs bass (missing)',
+          action: 'deep lows +' + subLift.toFixed(1) + ' dB before processing' });
+      }
 
       if (tb > 0.01) {
         out.correction = { lowDb: 5 * tb, bodyDb: 2 * tb, topDb: -3 * tb };
@@ -2588,6 +2606,11 @@
           for (let k = 0; k < 3; k++) { l = fl[k](l); r = fr[k](r); }
           left[i] = l; right[i] = r;
         }
+      }
+      if (adapt && adapt.subLiftDb > 0) {
+        const fl = makeBiquad('peaking', SUB_LIFT_HZ, sampleRate, SUB_LIFT_Q, adapt.subLiftDb);
+        const fr = makeBiquad('peaking', SUB_LIFT_HZ, sampleRate, SUB_LIFT_Q, adapt.subLiftDb);
+        for (let i = 0; i < left.length; i++) { left[i] = fl(left[i]); right[i] = fr(right[i]); }
       }
     }});
 
