@@ -3809,7 +3809,7 @@
       });
       nodes.A.src.onended = () => {                       // natural end of track only
         if(my !== token) return;
-        playing = false; pausedAt = 0; nodes = null;
+        playing = false; pausedAt = 0; nodes = null; iosPlaybackSession(false);
         setPlayUi(); draw(); updateTime();
       };
       startCtxTime = t; startOffset = offset; playing = true;
@@ -3821,14 +3821,47 @@
       el.play.setAttribute('aria-label', playing ? 'Pause' : 'Play');
     }
 
+    // Playback context. The one handed over by the main flow was created at START, often
+    // seconds before any click here, and browsers may keep such a context suspended (or the
+    // output device may have changed since); a context created inside the Play click itself
+    // always starts running. AudioBuffers are not tied to a context, so the takes carry over.
+    function ensureRunning(){
+      if(ctx && ctx.state === 'running') return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      try { if(ctx && ctx.state !== 'closed') ctx.close(); } catch(e){}
+      ctx = new AC();
+      if(ctx.state === 'suspended'){ try { ctx.resume(); } catch(e){} }
+    }
+    // iPhone / iPad: Web Audio is muted by the ring/silent switch unless the page's audio
+    // session is "playback" -- set it where the API exists, and otherwise keep a silent
+    // <audio> element playing while the monitor plays (that switches the session too).
+    let silentEl = null;
+    function iosPlaybackSession(on){
+      try { if(navigator.audioSession) navigator.audioSession.type = on ? 'playback' : 'auto'; } catch(e){}
+      if(!/iPad|iPhone|iPod/.test(navigator.userAgent) && !(navigator.maxTouchPoints > 1 && /Mac/.test(navigator.platform))) return;
+      if(on){
+        if(!silentEl){
+          const sr = 8000, n = sr / 2, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+          const w = (o, str) => { for(let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+          w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true);
+          v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true);
+          v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, n * 2, true);
+          silentEl = document.createElement('audio');
+          silentEl.src = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+          silentEl.loop = true; silentEl.setAttribute('playsinline', '');
+        }
+        const pr = silentEl.play(); if(pr && pr.catch) pr.catch(() => {});
+      } else if(silentEl){ silentEl.pause(); }
+    }
+
     function togglePlay(){
-      if(!ctx || !bufs) return;
-      if(ctx.state === 'suspended') ctx.resume();
+      if(!bufs) return;
       if(playing){
         pausedAt = position();
-        stopSources(); playing = false;
+        stopSources(); playing = false; iosPlaybackSession(false);
         setPlayUi(); draw(); updateTime();
       } else {
+        ensureRunning(); iosPlaybackSession(true);
         if(pausedAt >= duration - 0.1) pausedAt = 0;
         startSources(pausedAt);
       }
@@ -3895,7 +3928,7 @@
     }
 
     function dispose(){
-      stopSources(); playing = false; dragging = false;
+      stopSources(); playing = false; dragging = false; iosPlaybackSession(false);
       if(raf){ cancelAnimationFrame(raf); raf = 0; }
       if(ctx){ try { ctx.close(); } catch(e){} }
       ctx = null; bufs = null; peaks = null; view = null; duration = 0; pausedAt = 0;
