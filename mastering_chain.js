@@ -617,6 +617,7 @@
 
   // ---------------- stage 2: True Iron (transformer saturation) ----------------
   const IRON_SPLIT_HZ = 250, IRON_DRIVE_RMS_DB = -17;
+  const IRON_EVEN = 0.7, IRON_WARM_HZ = 200, IRON_WARM_DB = 1.5;
   function trueIronStage(left, right, params) {
     const strength = params.strength != null ? params.strength : 5.14;
     const mix = params.mix != null ? params.mix : 0.6;
@@ -646,15 +647,26 @@
     // warm low-order harmonics on bass and kick, no intermodulation riding on the
     // vocals and cymbals, and nothing high enough to fold back as aliasing.
     const split = params.lowBandOnly ? { l: makeCrossoverLP(IRON_SPLIT_HZ, params.sampleRate), r: makeCrossoverLP(IRON_SPLIT_HZ, params.sampleRate) } : null;
+    // Warmth (processing levels): an even (2nd-harmonic) term on the same low band -- bass
+    // at 60-120 Hz gains its octave at 120-240 Hz, which reads as warm and full rather than
+    // gritty -- plus a gentle low-mid lift in the wet path. Both stay below ~500 Hz, so the
+    // voice and the top end are untouched. The squared term's DC is removed (10 Hz HP).
+    const warm = split ? {
+      peakL: makeBiquad('peaking', IRON_WARM_HZ, params.sampleRate, 0.8, IRON_WARM_DB),
+      peakR: makeBiquad('peaking', IRON_WARM_HZ, params.sampleRate, 0.8, IRON_WARM_DB),
+      dcL: makeBiquad('highpass', 10, params.sampleRate, 0.707), dcR: makeBiquad('highpass', 10, params.sampleRate, 0.707),
+    } : null;
     for (let i = 0; i < left.length; i++) {
       const dl = left[i], dr = right[i];
       let wl, wr, k;
       if (split) {
         // the drive follows the level of the band that is actually saturated, so a
         // bass-heavy mix and a light one get the same amount of low-end colour
-        const yl = lowShelfL(dl), yr = lowShelfR(dr), ll = split.l(yl), lr = split.r(yr);
+        const yl = warm.peakL(lowShelfL(dl)), yr = warm.peakR(lowShelfR(dr)), ll = split.l(yl), lr = split.r(yr);
         k = levelDrive ? levelDrive(ll, lr) : 1;
-        wl = yl - ll + sat(ll * k) / k; wr = yr - lr + sat(lr * k) / k;
+        const xl = ll * k, xr = lr * k;
+        wl = yl - ll + (sat(xl) + IRON_EVEN * warm.dcL(xl * xl)) / k;
+        wr = yr - lr + (sat(xr) + IRON_EVEN * warm.dcR(xr * xr)) / k;
       } else {
         k = levelDrive ? levelDrive(dl, dr) : 1;
         wl = sat(lowShelfL(dl) * k) / k;
@@ -1664,6 +1676,7 @@
   // shave off a very dynamic source to reach the loudness target. Beyond it the target is
   // lowered instead (never below the source's own loudness) so the hits keep their punch.
   const DYNAMICS_BUDGET_DB = { soulfunk: 6, hiphop: 5, edm: 4 };
+  const DYNAMICS_REF_CEILING_DB = -0.3;
 
   // Turn the measured source features into parameter changes for the processing levels,
   // plus a human-readable report for the UI. Thresholds were calibrated on pink noise, a
@@ -1734,9 +1747,12 @@
     }
     const budget = DYNAMICS_BUDGET_DB[genreKey];
     if (!targetForced && budget != null && !isHotMaster && originalLufs > -50) {
-      const needed = plr - (ceilingDb - targetLUFS);          // dB of peaks to shave at full target
+      // Measured against the -0.3 dBTP ceiling the budgets were tuned with: moving the
+      // ceiling to -1.0 must not make dynamic tracks come out quieter.
+      const refCeil = Math.max(ceilingDb, DYNAMICS_REF_CEILING_DB);
+      const needed = plr - (refCeil - targetLUFS);            // dB of peaks to shave at full target
       if (needed > budget) {
-        const capped = Math.max(ceilingDb - (plr - budget), originalLufs);
+        const capped = Math.max(refCeil - (plr - budget), originalLufs);
         if (capped < targetLUFS) {
           report.push({ key: 'dynamics', label: 'Dynamics', value: 'very dynamic source', action: 'loudness target ' + targetLUFS.toFixed(1) + ' -> ' + capped.toFixed(1) + ' LUFS to keep punch' });
           out.targetLUFS = capped;
@@ -1830,11 +1846,9 @@
     const genreTargetLUFS = { soulfunk: -11.5, universal: -12, hiphop: -13, vinyl: -11, tape: -11 };
     let targetLUFS = options.targetLUFS != null ? options.targetLUFS
                        : (isEDM ? edmTarget : (genreTargetLUFS[genreKey] != null ? genreTargetLUFS[genreKey] : -12));
-    // True-peak ceiling: -0.3 dBTP on the processing levels (as the user's own Pro-L 2
-    // in Ableton) -- the extra 0.7 dB lets them reach target without costing punch.
-    // The Tape / Vinyl effects keep -1.0.
-    const targetTruePeakDb = options.finalTruePeakDb != null ? options.finalTruePeakDb
-                       : ((isEDM || hasLevel) ? -0.3 : -1.0);
+    // True-peak ceiling: -1.0 dBTP everywhere (Oct 2026, the user's choice): headroom for
+    // MP3/AAC encoding and streaming conversion; the loudness targets are unchanged.
+    const targetTruePeakDb = options.finalTruePeakDb != null ? options.finalTruePeakDb : -1.0;
 
     // Adaptation to the measured source (processing levels only; see adaptToSource).
     const adapt = hasLevel ? adaptToSource(spectrum, metrics, originalLufs, targetLUFS, targetTruePeakDb, genreKey, isHotMaster, options.targetLUFS != null) : null;
