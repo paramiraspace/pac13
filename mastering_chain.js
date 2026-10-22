@@ -80,6 +80,62 @@
     return function (x) { return b(a(x)); };
   }
 
+  // ---------------- 4x band-limited interpolation ----------------
+  // Kaiser-windowed sinc, 32 taps per phase (accurate to ~21 kHz at 48 kHz). Used to see
+  // inter-sample (true) peaks and to run the clipper oversampled. Linear interpolation between two samples can never exceed
+  // the samples themselves, so it is blind to inter-sample peaks.
+  const OS = 4, OS_TAPS = 32, OS_HALF = OS_TAPS / 2;
+  const OS_H = (function () {
+    const N = OS * OS_TAPS + 1, c = (N - 1) / 2, beta = 8;
+    function i0(x) { let s = 1, t = 1; for (let k = 1; k < 40; k++) { t *= (x / (2 * k)) * (x / (2 * k)); s += t; } return s; }
+    const h = new Float64Array(N);
+    for (let n = 0; n < N; n++) {
+      const t = (n - c) / OS, r = (n - c) / c;
+      const sinc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t);
+      h[n] = sinc * i0(beta * Math.sqrt(Math.max(0, 1 - r * r))) / i0(beta);
+    }
+    return { h: h, c: c };
+  })();
+  // OS_PHASE[p][k]: weight of x[i - OS_HALF + 1 + k] for the value at time i + p / OS
+  // (each phase sums to 1; phase 0 is the sample itself).
+  const OS_PHASE = (function () {
+    const out = [];
+    for (let p = 0; p < OS; p++) {
+      const taps = new Float64Array(OS_TAPS); let sum = 0;
+      for (let k = 0; k < OS_TAPS; k++) { taps[k] = OS_H.h[OS_H.c + p - (k - OS_HALF + 1) * OS]; sum += taps[k]; }
+      for (let k = 0; k < OS_TAPS; k++) taps[k] /= sum;
+      out.push(taps);
+    }
+    return out;
+  })();
+  function interpAt(buf, i, p) {
+    const taps = OS_PHASE[p], n = buf.length, j0 = i - OS_HALF + 1;
+    let y = 0;
+    if (j0 >= 0 && j0 + OS_TAPS <= n) { for (let k = 0; k < OS_TAPS; k++) y += buf[j0 + k] * taps[k]; }
+    else { for (let k = 0; k < OS_TAPS; k++) { const j = j0 + k; if (j >= 0 && j < n) y += buf[j] * taps[k]; } }
+    return y;
+  }
+  // Largest |value| of the band-limited signal between sample i and i+1 (inclusive of i).
+  function peakAround(buf, i) {
+    let pk = Math.abs(buf[i]);
+    for (let p = 1; p < OS; p++) { const v = Math.abs(interpAt(buf, i, p)); if (v > pk) pk = v; }
+    return pk;
+  }
+  // Per-sample true-peak envelope of a stereo pair: max over both channels of the sample
+  // and the 3 interpolated points after it. Inter-sample points are only computed where
+  // the neighbourhood is within 6 dB of `floorLin` (they cannot matter elsewhere).
+  function truePeakEnvelope(left, right, floorLin) {
+    const n = left.length, out = new Float32Array(n), thr = floorLin * 0.5;
+    for (let i = 0; i < n; i++) {
+      let s = Math.max(Math.abs(left[i]), Math.abs(right[i]));
+      let near = s;
+      for (let j = Math.max(0, i - 3); j <= Math.min(n - 1, i + 4); j++) { const v = Math.max(Math.abs(left[j]), Math.abs(right[j])); if (v > near) near = v; }
+      if (near > thr) s = Math.max(peakAround(left, i), peakAround(right, i));
+      out[i] = s;
+    }
+    return out;
+  }
+
   // ---------------- envelope follower ----------------
   function makeEnvelope(sampleRate, attackMs, releaseMs) {
     const aCoef = Math.exp(-1 / (sampleRate * Math.max(attackMs, 0.01) / 1000));
@@ -111,24 +167,40 @@
   // the harmonic density follows the music. k never goes below 1 (never less colour).
   const LEVEL_DRIVE_RMS_DB = -8;
   const LEVEL_DRIVE_MAX = 6;
-  function makeLevelDrive(sampleRate) {
+  // With minK below 1 the drive also comes DOWN on loud material, so the curve works at
+  // the same depth relative to the music whatever its level (a loud bass line otherwise
+  // hits the curve far harder than intended).
+  function makeLevelDrive(sampleRate, targetDb, minK) {
     const coef = Math.exp(-1 / (sampleRate * 0.3));
-    const target = Math.pow(10, LEVEL_DRIVE_RMS_DB / 20);
+    const target = Math.pow(10, (targetDb != null ? targetDb : LEVEL_DRIVE_RMS_DB) / 20);
+    const lo = minK != null ? minK : 1;
     let ms = target * target;
     return function (l, r) {
       ms = coef * ms + (1 - coef) * 0.5 * (l * l + r * r);
       const k = target / Math.sqrt(ms + 1e-12);
-      return k < 1 ? 1 : (k > LEVEL_DRIVE_MAX ? LEVEL_DRIVE_MAX : k);
+      return k < lo ? lo : (k > LEVEL_DRIVE_MAX ? LEVEL_DRIVE_MAX : k);
     };
   }
 
-  // ---------------- K-weighting (ITU-R BS.1770-style) + integrated LUFS ----------------
-  // Filter design values below are the standard analog-prototype parameters used to
-  // redesign the BS.1770 K-weighting filters at arbitrary sample rates (stage 1: high
-  // shelf ~+4dB around 1.7kHz; stage 2: high-pass around 38Hz, RLB weighting).
+  // ---------------- K-weighting (ITU-R BS.1770) + integrated LUFS ----------------
+  // The two K-weighting biquads, redesigned for any sample rate from their analogue
+  // prototypes the way libebur128 does (identical to the BS.1770 table at 48 kHz). The
+  // RBJ cookbook shelf with the same corner/gain is a different curve: it read mids
+  // 0.3-0.4 dB low, so mid-heavy tracks were pushed that much past the target.
+  function makeRawBiquad(b0, b1, b2, a1, a2) {
+    let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    return function (x) { const y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2; x2 = x1; x1 = x; y2 = y1; y1 = y; return y; };
+  }
   function makeKWeighting(sampleRate) {
-    const shelf = makeBiquad('highshelf', 1681.9744509555319, sampleRate, 0.7071752369554196, 3.999843853973347);
-    const hp = makeBiquad('highpass', 38.13547087602444, sampleRate, 0.5003270373238773, 0);
+    let f0 = 1681.974450955533, G = 3.999843853973347, Q = 0.7071752369554196;
+    let K = Math.tan(Math.PI * f0 / sampleRate);
+    const Vh = Math.pow(10, G / 20), Vb = Math.pow(Vh, 0.4996667741545416);
+    let a0 = 1 + K / Q + K * K;
+    const shelf = makeRawBiquad((Vh + Vb * K / Q + K * K) / a0, 2 * (K * K - Vh) / a0, (Vh - Vb * K / Q + K * K) / a0,
+                                2 * (K * K - 1) / a0, (1 - K / Q + K * K) / a0);
+    f0 = 38.13547087602444; Q = 0.5003270373238773; K = Math.tan(Math.PI * f0 / sampleRate);
+    a0 = 1 + K / Q + K * K;
+    const hp = makeRawBiquad(1, -2, 1, 2 * (K * K - 1) / a0, (1 - K / Q + K * K) / a0);
     return function (x) { return hp(shelf(x)); };
   }
 
@@ -323,7 +395,7 @@
   const TRANSIENT_GUARD = 0.85;
   // With unity-gain saturation the wet path no longer rides ~+5..8 dB over the dry one,
   // so the same mix carries far fewer harmonics; the levels drive it harder to compensate.
-  const LEVEL_IRON_MIX_BOOST = 4.0;
+  const LEVEL_IRON_MIX_BOOST = 3.0;
   const LEVEL_WARMTH_BOOST = 2.0;
   const ENHANCER_ATTACK_MS_LEVELS = 15;
 
@@ -351,8 +423,8 @@
   // Bands are the SAME log centres the static nudge used (plus a low-mid control band),
   // so the two systems shape the same regions -- this one just decides direction and
   // amount from measurement instead of assuming a neutral source.
-  const ADAPTIVE_CAP_DB = 2.5;      // max cut/boost per band (protects artist intent)
-  const ADAPTIVE_STRENGTH = 0.8;    // fraction of the measured deviation we correct
+  const ADAPTIVE_CAP_DB = 2.0;      // max cut/boost per band (protects artist intent)
+  const ADAPTIVE_STRENGTH = 0.6;    // fraction of the measured deviation we correct
 
   // Analysis band centres (Hz). Each is measured with a bandpass built from LR crossovers
   // and shaped as a peaking (or shelf at the ends) move. Ordered low -> high.
@@ -365,21 +437,23 @@
     { freq: 9000, lo: 6000, hi: 14000,type: 'highshelf', Q: 0.7 },
   ];
 
-  // Genre reference band balances, in dB RELATIVE to each curve's own broadband average
-  // (i.e. how much louder/quieter each band sits vs the whole-spectrum mean). Read off
-  // the iZotope Tonal Balance Control target curves. Soul/Funk: fuller low-mids and a
-  // gentle presence/air shoulder. Hip-Hop: strong lows, scooped low-mids, controlled
-  // presence. Only genres with a reference get adaptive correction; others fall back to
-  // the static nudge (or nothing).
+  // Reference band balances, in the units measureBandBalance returns (each band's RMS in
+  // dB relative to the mean over the six bands). The first version was read off iZotope
+  // Tonal Balance Control's display, which uses a different scale: measured this way,
+  // every real track sat ~6 dB "too heavy" at 120 Hz and ~4 dB "too dark" at 9 kHz
+  // against it, so any style cut the lows and lifted the top by the full cap on every
+  // song (thinner and harsher). Recalibrated (Oct 2026) on finished tracks measured with
+  // this same code -- hip-hop, electronic, EDM, pop and 80s funk; the average is the
+  // Acoustic-Live curve, and Modern / Electronic keep the differences to it that the
+  // original genre curves had (Modern: more 120 Hz, fewer low-mids, darker top;
+  // Electronic: more 120 Hz, leaner 350-700 Hz, a brighter top).
   const ADAPTIVE_REFERENCE = {
-    //          120    350    700   1800   4000   9000
-    soulfunk: [ +4.0,  +1.0,  +0.5,  -0.5,  -1.5,  -3.0 ],
-    hiphop:   [ +5.5,  -1.0,  +0.5,  -0.5,  -2.0,  -4.0 ],
-    // [INIT] EDM / electronic: heavy, clean lows, no low-mid shoulder, a smooth decline
-    // and a brighter top than hip-hop. A placeholder shape until it is calibrated on
-    // real electronic masters.
-    electronic: [ +6.0, -0.5, -1.0,  -1.0,  -1.5,  -2.0 ],
+    //            120    350    700   1800   4000   9000
+    soulfunk:   [ 11.2,  4.1,   0.2,  -3.2,  -5.5,  -6.8 ],
+    hiphop:     [ 13.0,  2.4,   0.5,  -2.9,  -5.7,  -7.5 ],
+    electronic: [ 13.3,  2.7,  -1.2,  -3.6,  -5.4,  -5.7 ],
   };
+
 
   // User-selectable tonal styles (independent of the processing level) and the
   // reference curve each one pulls toward.
@@ -429,7 +503,7 @@
   // balance against the reference. Returns an array of {type,freq,Q,gainDb} ready for the
   // same biquad chain the static nudge uses. gainDb is already capped; direction and size
   // come from the measurement. Bands within DEADBAND_DB of the reference are left alone.
-  const ADAPTIVE_DEADBAND_DB = 0.5; // don't fiddle with bands already close to target
+  const ADAPTIVE_DEADBAND_DB = 1.0; // don't fiddle with bands already close to target
   function buildAdaptiveTonalMoves(genreKey, measuredBalanceDb) {
     const ref = ADAPTIVE_REFERENCE[genreKey];
     if (!ref || !measuredBalanceDb) return null;
@@ -542,6 +616,7 @@
   }
 
   // ---------------- stage 2: True Iron (transformer saturation) ----------------
+  const IRON_SPLIT_HZ = 250, IRON_DRIVE_RMS_DB = -17;
   function trueIronStage(left, right, params) {
     const strength = params.strength != null ? params.strength : 5.14;
     const mix = params.mix != null ? params.mix : 0.6;
@@ -564,12 +639,27 @@
     }
     const guardDepth = params.transientGuard || 0;
     const guard = guardDepth > 0 ? makeTransientGuard(params.sampleRate) : null;
-    const levelDrive = params.levelDrive ? makeLevelDrive(params.sampleRate) : null;
+    const levelDrive = params.levelDrive ? makeLevelDrive(params.sampleRate, IRON_DRIVE_RMS_DB, params.lowBandOnly ? 0.25 : 1) : null;
+    // Processing levels: like a real output transformer, only the lows saturate (core
+    // flux rises as frequency falls). The band above IRON_SPLIT_HZ passes the curve
+    // untouched (complementary split, so the linear part is exactly the shelved input):
+    // warm low-order harmonics on bass and kick, no intermodulation riding on the
+    // vocals and cymbals, and nothing high enough to fold back as aliasing.
+    const split = params.lowBandOnly ? { l: makeCrossoverLP(IRON_SPLIT_HZ, params.sampleRate), r: makeCrossoverLP(IRON_SPLIT_HZ, params.sampleRate) } : null;
     for (let i = 0; i < left.length; i++) {
       const dl = left[i], dr = right[i];
-      const k = levelDrive ? levelDrive(dl, dr) : 1;
-      const wl = sat(lowShelfL(dl) * k) / k;
-      const wr = sat(lowShelfR(dr) * k) / k;
+      let wl, wr, k;
+      if (split) {
+        // the drive follows the level of the band that is actually saturated, so a
+        // bass-heavy mix and a light one get the same amount of low-end colour
+        const yl = lowShelfL(dl), yr = lowShelfR(dr), ll = split.l(yl), lr = split.r(yr);
+        k = levelDrive ? levelDrive(ll, lr) : 1;
+        wl = yl - ll + sat(ll * k) / k; wr = yr - lr + sat(lr * k) / k;
+      } else {
+        k = levelDrive ? levelDrive(dl, dr) : 1;
+        wl = sat(lowShelfL(dl) * k) / k;
+        wr = sat(lowShelfR(dr) * k) / k;
+      }
       const m = guard ? mix * (1 - guardDepth * guard(Math.max(Math.abs(dl), Math.abs(dr)))) : mix;
       left[i] = dl * (1 - m) + wl * m;
       right[i] = dr * (1 - m) + wr * m;
@@ -584,16 +674,23 @@
   // rather than relying on compression to create the sense of loudness.
   function transientEmphasisStage(left, right, sampleRate, amount) {
     if (!amount || amount <= 0) return { left, right };
-    const fastEnv = makeEnvelope(sampleRate, 0.5, 6);
-    const slowEnv = makeEnvelope(sampleRate, 25, 90);
+    // Detector: power (not peak) envelopes of the signal above 150 Hz. A peak follower
+    // with a 6 ms release rides every half-cycle of a sustained bass note, so the gain
+    // wobbled at twice the note's frequency (~1.5% distortion on a plain 40 Hz tone);
+    // attacks still stand out clearly in the band above the bass.
+    const hpL = makeBiquad('highpass', 150, sampleRate, 0.707), hpR = makeBiquad('highpass', 150, sampleRate, 0.707);
+    const fc = 1 - Math.exp(-1 / (sampleRate * 0.002)), sc = 1 - Math.exp(-1 / (sampleRate * 0.04));
+    const gc = 1 - Math.exp(-1 / (sampleRate * 0.001));
+    let fp = 0, sp = 0, gDb = 0;
     const n = left.length;
     for (let i = 0; i < n; i++) {
-      const rect = Math.max(Math.abs(left[i]), Math.abs(right[i]));
-      const fe = fastEnv(rect);
-      const se = slowEnv(rect);
-      const diffDb = linToDb(fe) - linToDb(se);
-      const boostDb = diffDb > 0 ? Math.min(diffDb, 4) * amount : 0;
-      const g = dbToLin(boostDb);
+      const a = hpL(left[i]), b = hpR(right[i]);
+      const pw = Math.max(a * a, b * b);
+      fp += (pw - fp) * fc; sp += (pw - sp) * sc;
+      const diffDb = 10 * Math.log10((fp + 1e-12) / (sp + 1e-12));
+      const target = diffDb > 0 ? Math.min(diffDb, 4) * amount : 0;
+      gDb += (target - gDb) * gc;
+      const g = dbToLin(gDb);
       left[i] *= g; right[i] *= g;
     }
     return { left, right };
@@ -610,6 +707,15 @@
   //     boosting high-frequency transients (cymbal/hat/consonant attacks) for
   //     "readable", crisp detail without raising sustained hiss.
   // Plus a gentle high-shelf to compensate the measured ~1dB crossover treble loss.
+  const AIR_GEN_LEVEL = 0.5, AIR_GEN_FULLBAND = 0.35;
+  function zeroPhaseHighpass(x, freq, sampleRate) {
+    const out = new Float32Array(x.length);
+    let f = makeBiquad('highpass', freq, sampleRate, 0.7071);
+    for (let i = 0; i < x.length; i++) out[i] = f(x[i]);
+    f = makeBiquad('highpass', freq, sampleRate, 0.7071);
+    for (let i = x.length - 1; i >= 0; i--) out[i] = f(out[i]);
+    return out;
+  }
   function airExciterStage(left, right, sampleRate, amount, adapt) {
     adapt = adapt || {};
     if (!amount || amount <= 0) return { left, right };
@@ -619,7 +725,9 @@
     // Two overlapping shelves (a lower one at 3.5k for the 4-8kHz dip, a higher one at
     // 9k for the top octave) reconstruct the measured crossover loss curve more evenly
     // than a single shelf, which otherwise leaves a 4-8kHz notch.
-    const compScale = clamp(amount / 0.5, 0, 1);
+    // Processing levels (adapt.level): the multiband split is complementary there and loses
+    // nothing, so the compensation shelves would only add a fixed +1..2 dB of treble.
+    const compScale = adapt.level ? 0 : clamp(amount / 0.5, 0, 1);
     const presenceScale = adapt.presenceScale != null ? adapt.presenceScale : 1;
     const compLowL = makeBiquad('highshelf', 3500, sampleRate, 0.6, 1.0 * compScale * presenceScale);
     const compLowR = makeBiquad('highshelf', 3500, sampleRate, 0.6, 1.0 * compScale * presenceScale);
@@ -650,20 +758,50 @@
     const sparkleHpR = makeCrossoverHP(7000, sampleRate);
 
     const genMix = 0.12 * amount * (adapt.genBoost || 1); // synthesized harmonic content
+    // Processing levels: an exactly band-limited generator. The 5-10.5 kHz band (8th-order top edge) is squared
+    // (2nd harmonic only, so nothing can land above 22 kHz and fold back) and divided by its
+    // own envelope (so the result follows the music linearly), then high-passed to keep
+    // just the new octave above (10-22 kHz). The tanh generator below also passes the
+    // source's 7.5 kHz+ band through at ~2.4x and folds its 3rd harmonic back into the
+    // audio band (a 15 kHz partial lands at 3 kHz).
+    const q = adapt.level ? {
+      bpL: [makeCrossoverHP(5000, sampleRate), makeCrossoverLP(10500, sampleRate), makeCrossoverLP(10500, sampleRate)],
+      bpR: [makeCrossoverHP(5000, sampleRate), makeCrossoverLP(10500, sampleRate), makeCrossoverLP(10500, sampleRate)],
+      envL: makeEnvelope(sampleRate, 1, 40), envR: makeEnvelope(sampleRate, 1, 40),
+      hpL: makeCrossoverHP(adapt.genHpHz || 10000, sampleRate), hpR: makeCrossoverHP(adapt.genHpHz || 10000, sampleRate),
+    } : null;
+    // A lossy source gets the new octave only above its encoder cutoff (refilling the empty
+    // band); a full-band one gets a small amount over 10 kHz. Filling in under the cutoff
+    // too stacked up to +10 dB of extra 12-16 kHz on dark sources (a soft piano).
+    const qMix = AIR_GEN_LEVEL * amount * (adapt.genHpHz ? (adapt.genBoost || 1) : AIR_GEN_FULLBAND);
     const sparkleAmount = 0.6 * amount; // HF transient boost depth
 
+    // Processing levels: the sparkle band is a zero-phase high-pass (2nd order run forward
+    // and backward over the whole track). Adding back a phase-shifted high-pass lifts the
+    // top but partly cancels the dry signal around its corner (a dip at 4-8 kHz).
+    let zpL = null, zpR = null;
+    if (adapt.level) {
+      zpL = zeroPhaseHighpass(left, 7000, sampleRate); zpR = zeroPhaseHighpass(right, 7000, sampleRate);
+    }
     for (let i = 0; i < n; i++) {
       let l = compShelfL(compLowL(left[i]));
       let r = compShelfR(compLowR(right[i]));
 
       // 1) harmonic generation: soft asymmetric saturation of the isolated top band,
       //    band-limited, then mixed back in
-      const genInL = hpGenL(left[i]);
-      const genInR = hpGenR(right[i]);
-      const harmL = genLpL(Math.tanh(genInL * 3.0) - genInL * 0.6); // 2nd/3rd harmonic residue
-      const harmR = genLpR(Math.tanh(genInR * 3.0) - genInR * 0.6);
-      l += harmL * genMix;
-      r += harmR * genMix;
+      if (q) {
+        const bl = q.bpL[2](q.bpL[1](q.bpL[0](left[i]))), br = q.bpR[2](q.bpR[1](q.bpR[0](right[i])));
+        const el = q.envL(Math.abs(bl)), er = q.envR(Math.abs(br));
+        l += genLpL(q.hpL(bl * bl / (el + 1e-6))) * qMix;
+        r += genLpR(q.hpR(br * br / (er + 1e-6))) * qMix;
+      } else {
+        const genInL = hpGenL(left[i]);
+        const genInR = hpGenR(right[i]);
+        const harmL = genLpL(Math.tanh(genInL * 3.0) - genInL * 0.6); // 2nd/3rd harmonic residue
+        const harmR = genLpR(Math.tanh(genInR * 3.0) - genInR * 0.6);
+        l += harmL * genMix;
+        r += harmR * genMix;
+      }
 
       // 2) HF transient sparkle: detect high-band attacks, briefly lift the high band
       const detRect = Math.max(Math.abs(hpDetL(left[i])), Math.abs(hpDetR(right[i])));
@@ -672,8 +810,8 @@
       const transientStrength = clamp(linToDb(fe) - linToDb(se), 0, 6) / 6; // 0..1
       const sparkleBoost = transientStrength * sparkleAmount; // 0..sparkleAmount
       // add a fraction of the (highpassed) high band back on top, scaled by transient strength
-      const hiL = sparkleHpL(l);
-      const hiR = sparkleHpR(r);
+      const hiL = zpL ? zpL[i] : sparkleHpL(l);
+      const hiR = zpR ? zpR[i] : sparkleHpR(r);
       l += hiL * sparkleBoost;
       r += hiR * sparkleBoost;
 
@@ -721,6 +859,7 @@
     // Side split at 1.2 kHz: low-mid side gets half the widening, highs get all of it.
     // sideLo + (side - sideLo) reconstructs side exactly, so width 1 is a true bypass.
     const sideLp = makeBiquad('lowpass', 1200, sampleRate, 0.707);
+    const sideHpMono = makeCrossoverHP(monoMkrHz, sampleRate);
     // Only the three processing levels use the split; the effects keep flat side gain.
     const widthLo = params.widthSplit ? 1 + (stWidth - 1) * 0.5 : stWidth;
 
@@ -746,15 +885,21 @@
       // frequency-selective width+mono-sum on the final blend (single crossover
       // pass instead of one-per-path -- cheaper, and correct either way since
       // this is the only mono-sum point that matters for the actual output)
-      const lowFL = monoLpFinalL(blL), lowFR = monoLpFinalR(blR);
-      // Processing levels: complementary split (high = input - low), so the mono-maker's
-      // LR4 allpass no longer smears the kick (45-130 Hz) against its attack. The effects
-      // keep the original LR4 high-pass.
-      const highFL = params.widthSplit ? blL - lowFL : monoHpFinalL(blL);
-      const highFR = params.widthSplit ? blR - lowFR : monoHpFinalR(blR);
-      const lowFMono = (lowFL + lowFR) * 0.5;
-      const midHigh = (highFL + highFR) * 0.5;
-      const side = (highFL - highFR) * 0.5;
+      let lowFMono, midHigh, side;
+      if (params.widthSplit) {
+        // Processing levels: the mid passes untouched and only the side is high-passed
+        // below the mono point. (Taking side minus its low-pass instead -- the earlier
+        // complementary split -- raised the side ~+5 dB around the mono frequency, the
+        // opposite of mono bass.)
+        lowFMono = 0; midHigh = (blL + blR) * 0.5;
+        side = sideHpMono((blL - blR) * 0.5);
+      } else {
+        const lowFL = monoLpFinalL(blL), lowFR = monoLpFinalR(blR);
+        const highFL = monoHpFinalL(blL), highFR = monoHpFinalR(blR);
+        lowFMono = (lowFL + lowFR) * 0.5;
+        midHigh = (highFL + highFR) * 0.5;
+        side = (highFL - highFR) * 0.5;
+      }
       const sideLo = sideLp(side);
       const sideHigh = sideLo * widthLo + (side - sideLo) * stWidth;
       left[i] = lowFMono + midHigh + sideHigh;
@@ -893,6 +1038,7 @@
   // (level-independent) tube-style coloration blended in via Wet/Dry, exactly like the
   // real device in this mode. Threshold knob is inert in this mode, matching what was
   // observed directly on the hardware/plugin.
+  const KAZROG_TOP_HZ = 5000, KAZROG_DRIVE_RMS_DB = -14;
   function kazrogWarmthStage(left, right, params) {
     const warmth = params.warmth != null ? params.warmth : 0.464; // ~46.4% from the plugin screenshot
     const wetDry = params.wetDry != null ? params.wetDry : 0.434; // ~43.4% from the plugin screenshot
@@ -915,11 +1061,19 @@
 
     const guardDepth = params.transientGuard || 0;
     const guard = guardDepth > 0 ? makeTransientGuard(params.sampleRate) : null;
-    const levelDrive = params.levelDrive ? makeLevelDrive(params.sampleRate) : null;
+    const levelDrive = params.levelDrive ? makeLevelDrive(params.sampleRate, KAZROG_DRIVE_RMS_DB, params.bandLimited ? 0.25 : 1) : null;
+    // Processing levels: the curve sees the band below KAZROG_TOP_HZ only; the top passes
+    // straight through (complementary split). Saturating 8-20 kHz at the base rate folds
+    // its 3rd harmonic back into the audio band as inharmonic tones.
+    const split = params.bandLimited ? { l: makeCrossoverLP(KAZROG_TOP_HZ, params.sampleRate), r: makeCrossoverLP(KAZROG_TOP_HZ, params.sampleRate) } : null;
     for (let i = 0; i < n; i++) {
       const dl = left[i], dr = right[i];
       const k = levelDrive ? levelDrive(dl, dr) : 1;
-      const wl = tube(dl * k) / k, wr = tube(dr * k) / k;
+      let wl, wr;
+      if (split) {
+        const ll = split.l(dl), lr = split.r(dr);
+        wl = dl - ll + tube(ll * k) / k; wr = dr - lr + tube(lr * k) / k;
+      } else { wl = tube(dl * k) / k; wr = tube(dr * k) / k; }
       const m = guard ? wetDry * (1 - guardDepth * guard(Math.max(Math.abs(dl), Math.abs(dr)))) : wetDry;
       outL[i] = dl * (1 - m) + wl * m;
       outR[i] = dr * (1 - m) + wr * m;
@@ -1288,83 +1442,69 @@
   }
 
 
-  function lookaheadTruePeakLimiter(left, right, targetDb, sampleRate, oversample) {
-    oversample = oversample || 4;
-    const n = left.length;
+  // ---------------- true-peak lookahead limiter ----------------
+  // Peaks are read on the 4x band-limited signal (inter-sample peaks included). The gain
+  // curve is a forward minimum over the lookahead window followed by a moving average of
+  // the same length, so gain reduction ramps in smoothly and is fully in place exactly at
+  // the peak (a hard step in gain is itself a click / broadband distortion), then
+  // releases exponentially.
+  function lookaheadTruePeakLimiter(left, right, targetDb, sampleRate) {
     const targetLin = dbToLin(targetDb);
-
-    function truePeakAt(buf, i) {
-      let peak = Math.abs(buf[i]);
-      if (i < n - 1) {
-        const a = buf[i], b = buf[i + 1];
-        for (let k = 1; k < oversample; k++) {
-          const av = Math.abs(a + (b - a) * (k / oversample));
-          if (av > peak) peak = av;
-        }
-      }
-      return peak;
+    // The gain changes across the interpolator's window, so a very dense, heavily limited
+    // passage can come out slightly over; up to two more passes catch that locally before
+    // the whole-track safety trim is used.
+    let env = truePeakEnvelope(left, right, targetLin), minAppliedGain = 1;
+    for (let pass = 0; pass < 3; pass++) {
+      if (maxOf(env) <= targetLin * 1.0023) break;
+      minAppliedGain *= limiterPass(left, right, env, targetLin, sampleRate);
+      env = truePeakEnvelope(left, right, targetLin);
     }
-
-    const lookaheadMs = 5;
-    const lookaheadSamples = Math.max(1, Math.round(sampleRate * lookaheadMs / 1000));
-    const releaseMs = 80;
-    const releaseCoef = Math.exp(-1 / (sampleRate * releaseMs / 1000));
-
-    const rawGain = new Float32Array(n);
-    for (let i = 0; i < n; i++) {
-      const p = Math.max(truePeakAt(left, i), truePeakAt(right, i), 1e-9);
-      rawGain[i] = Math.min(1, targetLin / p);
-    }
-
-    const lookaheadGain = new Float32Array(n);
-    const idxDeque = [];
-    let dqStart = 0;
-    for (let i = n - 1; i >= 0; i--) {
-      while (idxDeque.length > dqStart && rawGain[idxDeque[idxDeque.length - 1]] >= rawGain[i]) idxDeque.pop();
-      idxDeque.push(i);
-      const windowEnd = i + lookaheadSamples;
-      while (idxDeque.length > dqStart && idxDeque[dqStart] > windowEnd) dqStart++;
-      lookaheadGain[i] = rawGain[idxDeque[dqStart]];
-    }
-
-    let smoothGain = 1, minAppliedGain = 1;
-    for (let i = 0; i < n; i++) {
-      const g = lookaheadGain[i];
-      if (g < smoothGain) smoothGain = g;
-      else { smoothGain = g + (smoothGain - g) * releaseCoef; if (smoothGain > 1) smoothGain = 1; }
-      left[i] *= smoothGain; right[i] *= smoothGain;
-      if (smoothGain < minAppliedGain) minAppliedGain = smoothGain;
-    }
-
-    let finalPeak = 0;
-    for (let i = 0; i < n; i++) { finalPeak = Math.max(finalPeak, truePeakAt(left, i), truePeakAt(right, i)); }
-    let finalPeakDb = linToDb(finalPeak);
+    let finalPeakDb = linToDb(Math.max(1e-9, maxOf(env)));
     if (finalPeakDb > targetDb + 0.02) {
       const safety = dbToLin(targetDb - finalPeakDb);
-      for (let i = 0; i < n; i++) { left[i] *= safety; right[i] *= safety; }
+      for (let i = 0; i < left.length; i++) { left[i] *= safety; right[i] *= safety; }
       finalPeakDb = targetDb;
     }
-
     return { left, right, finalPeakDb: Math.min(finalPeakDb, targetDb), limiterGainReductionDb: linToDb(minAppliedGain) };
   }
-
-  // ---------------- true-peak measurement (standalone, oversampled) ----------------
-  function measureTruePeak(left, right, sampleRate, oversample) {
-    oversample = oversample || 8; // independent, higher-res than the limiter's own 4x pass
+  function limiterPass(left, right, env, targetLin, sampleRate) {
     const n = left.length;
-    let peak = 0;
-    for (const buf of [left, right]) {
-      for (let i = 0; i < n - 1; i++) {
-        const a = buf[i], b = buf[i + 1];
-        for (let k = 0; k < oversample; k++) {
-          const av = Math.abs(a + (b - a) * (k / oversample));
-          if (av > peak) peak = av;
-        }
-      }
-      const last = Math.abs(buf[n - 1]);
-      if (last > peak) peak = last;
+    const lookaheadSamples = Math.max(1, Math.round(sampleRate * 0.005));
+    const releaseCoef = Math.exp(-1 / (sampleRate * 0.08));
+    const rawGain = new Float32Array(n);
+    for (let i = 0; i < n; i++) { const p = env[i]; rawGain[i] = p > targetLin ? targetLin / p : 1; }
+    // forward minimum over [i, i + lookahead]
+    const hold = new Float32Array(n);
+    const dq = new Int32Array(n); let qh = 0, qt = 0;
+    for (let i = n - 1; i >= 0; i--) {
+      while (qt > qh && rawGain[dq[qt - 1]] >= rawGain[i]) qt--;
+      dq[qt++] = i;
+      while (dq[qh] > i + lookaheadSamples) qh++;
+      hold[i] = rawGain[dq[qh]];
     }
-    return linToDb(peak);
+    // instant attack / exponential release, then a moving average over the lookahead
+    let s = 1;
+    for (let i = 0; i < n; i++) {
+      const g = hold[i];
+      s = g < s ? g : g + (s - g) * releaseCoef;
+      hold[i] = s;
+    }
+    let acc = lookaheadSamples, minGain = 1;   // samples before the start count as gain 1
+    for (let i = 0; i < n; i++) {
+      acc += hold[i] - (i >= lookaheadSamples ? hold[i - lookaheadSamples] : 1);
+      const g = Math.min(1, acc / lookaheadSamples);
+      left[i] *= g; right[i] *= g;
+      if (g < minGain) minGain = g;
+    }
+    return minGain;
+  }
+  function maxOf(a) { let m = 0; for (let i = 0; i < a.length; i++) if (a[i] > m) m = a[i]; return m; }
+
+  // ---------------- true-peak measurement (4x band-limited) ----------------
+  function measureTruePeak(left, right) {
+    let sp = 0;
+    for (let i = 0; i < left.length; i++) { const v = Math.max(Math.abs(left[i]), Math.abs(right[i])); if (v > sp) sp = v; }
+    return linToDb(Math.max(1e-9, maxOf(truePeakEnvelope(left, right, sp))));
   }
 
   // ---------------- stage 7: loudness targeting (LUFS) with true-peak ceiling ----------------
@@ -1373,17 +1513,16 @@
   // to converge (limiting a hot peak can nudge the measured LUFS down slightly).
   // originalLufs is the UNPROCESSED input's loudness -- gain is never allowed to go
   // negative here, so processing cannot end up quieter than what was uploaded.
-  // intensityScale scales HOW FAR we reach toward targetLUFS: a thin/quiet source
-  // (high intensityScale) gets pushed close to the full target; a source that's
-  // already dense/well-produced (low intensityScale) only gets nudged a little above
-  // its own natural level, since aggressively closing that gap is exactly what forces
-  // the limiter to eat into transients -- "minimal processing" has to include this
-  // stage too, not just the coloration stages upstream.
   // Pre-limiter soft clipper (processing levels only). Shaves the top of the shortest
   // peaks so the limiter -- which ducks ~5 ms ahead and releases over 80 ms, turning down
-  // the whole hit -- has less to do. Linear below CLIP_KNEE * ceiling, then a tanh knee
-  // that never exceeds the clip level (slope 1 at the knee, so no kink).
+  // the whole hit -- has less to do. Linear below CLIP_KNEE * clip level, then a tanh knee
+  // that never exceeds the clip level. It runs 4x oversampled: clipping at the base rate
+  // folds its harmonics back into the audio band as inharmonic tones. Only the stretches
+  // that actually reach the knee are oversampled; elsewhere the clipper is exactly linear.
   const CLIP_ABOVE_CEILING_DB = 1.5; // clip level relative to the true-peak ceiling
+  // The limiter aims this far under the ceiling: its interpolator reads content above
+  // ~21 kHz slightly low compared with a longer reference filter.
+  const TP_MARGIN_DB = 0.15;
   const CLIP_KNEE = 0.7;
   function softClipStage(left, right, clipDb) {
     const c = dbToLin(clipDb), k = CLIP_KNEE * c, span = c - k;
@@ -1393,7 +1532,38 @@
       const y = k + span * Math.tanh((a - k) / span);
       return x < 0 ? -y : y;
     }
-    for (let i = 0; i < left.length; i++) { left[i] = clip(left[i]); right[i] = clip(right[i]); }
+    const h = OS_H.h, hc = OS_H.c;
+    [left, right].forEach(function (buf) {
+      const n = buf.length, act = new Uint8Array(n), probe = k * 0.45;
+      let any = false;
+      for (let i = 0; i < n; i++) if ((buf[i] < 0 ? -buf[i] : buf[i]) > probe) {
+        for (let j = Math.max(0, i - 3); j <= Math.min(n - 1, i + 3); j++) act[j] = 1;
+        any = true;
+      }
+      if (!any) return;
+      const corr = new Float32Array(n);
+      let i = 0;
+      while (i < n) {
+        if (!act[i]) { i++; continue; }
+        const a = i; while (i < n && act[i]) i++; const b = i - 1;
+        // residual of the clipper on the 4x grid over the active stretch
+        const len = (b - a + 1) * OS, d = new Float64Array(len);
+        let nz = false;
+        for (let t = a; t <= b; t++) for (let p = 0; p < OS; p++) {
+          const u = p === 0 ? buf[t] : interpAt(buf, t, p);
+          const r = clip(u) - u; d[(t - a) * OS + p] = r; if (r !== 0) nz = true;
+        }
+        if (!nz) continue;
+        // back to the base rate through the same band-limiting kernel
+        for (let t = Math.max(0, a - OS_HALF); t <= Math.min(n - 1, b + OS_HALF); t++) {
+          let y = 0;
+          const jLo = Math.max(0, (t - a) * OS - hc), jHi = Math.min(len - 1, (t - a) * OS + hc);
+          for (let j = jLo; j <= jHi; j++) y += d[j] * h[hc + j - (t - a) * OS];
+          corr[t] += y / OS;
+        }
+      }
+      for (let t = 0; t < n; t++) buf[t] += corr[t];
+    });
   }
 
   function loudnessTargetStage(left, right, targetLUFS, targetTruePeakDb, sampleRate, originalLufs, intensityScale, allowBelowOriginal, preClip) {
@@ -1420,46 +1590,48 @@
       effectiveTargetLUFS = targetLUFS;
     }
 
-    // 2 passes converge within ~0.1-0.2 LU on lightly limited material. The processing
-    // levels (clipper + harder limiting on loud sources) fell ~0.6-0.8 LU short of
-    // target with 2, so they get 4.
-    const maxIterations = preClip ? 4 : 2;
+    // Every pass starts again from the untouched input of this stage with an updated total
+    // gain, so the clipper and limiter shape the signal exactly once (re-clipping the
+    // previous pass's output reshapes the same peaks again and again). Passes stop once
+    // the result is within 0.1 LU of the target.
+    const srcL = Float32Array.from(left), srcR = Float32Array.from(right);
+    // After the first correction the next gain comes from the secant through the last two
+    // passes: once the limiter is working, +1 dB of gain buys less than +1 LU.
+    const maxIterations = 4;
+    let gainDb = lufsBefore < -50 ? 0 : clamp(effectiveTargetLUFS - lufsBefore, -20, 20);
+    let prevGain = null, prevLufs = null, best = null;
     for (let iter = 0; iter < maxIterations; iter++) {
-      let neededGainDb;
-      if (lufsNow < -50) {
-        neededGainDb = 0; // too quiet/silent to normalize safely -- avoid boosting noise floor
-      } else {
-        // The mid-chain (headroom staging + each stage's own saturation/blend
-        // behavior) can leave the signal considerably louder than the target even
-        // before this stage runs -- so this needs to be able to pull gain DOWN, not
-        // just add it. In normal mode the floor is the original upload's own loudness
-        // (never end up quieter than uploaded); in allowBelowOriginal (EDM) mode that
-        // floor is lifted so we can legitimately land slightly under the source.
-        const rawGainDb = effectiveTargetLUFS - lufsNow;
-        const minAllowedGainDb = (!allowBelowOriginal && originalLufs != null && originalLufs > -50)
-          ? Math.max(originalLufs - lufsNow, -20)
-          : -20;
-        neededGainDb = clamp(rawGainDb, minAllowedGainDb, 20);
-      }
-      if (neededGainDb !== 0) {
-        const g = dbToLin(neededGainDb);
+      if (iter > 0) { left = Float32Array.from(srcL); right = Float32Array.from(srcR); }
+      if (gainDb !== 0) {
+        const g = dbToLin(gainDb);
         for (let i = 0; i < left.length; i++) { left[i] *= g; right[i] *= g; }
-        totalGainDb += neededGainDb;
       }
-
+      totalGainDb = gainDb;
       if (preClip) softClipStage(left, right, targetTruePeakDb + CLIP_ABOVE_CEILING_DB);
-      const limited = lookaheadTruePeakLimiter(left, right, targetTruePeakDb, sampleRate, 4);
+      const limited = lookaheadTruePeakLimiter(left, right, targetTruePeakDb - TP_MARGIN_DB, sampleRate);
       left = limited.left; right = limited.right;
       limiterGainReductionDb = limited.limiterGainReductionDb;
-
       lufsNow = measureLUFS(left, right, sampleRate);
-      if (Math.abs(neededGainDb) < 0.15 && Math.abs(limited.limiterGainReductionDb) < 0.15) break;
+      if (lufsBefore < -50) break; // too quiet/silent to normalize safely -- avoid boosting noise floor
+      const err = effectiveTargetLUFS - lufsNow;
+      if (!best || Math.abs(err) < Math.abs(best.err)) best = { err: err, left: left, right: right, lufs: lufsNow, gain: gainDb, gr: limiterGainReductionDb };
+      if (Math.abs(err) < 0.1) break;
+      let next = gainDb + err;
+      if (prevGain !== null && Math.abs(lufsNow - prevLufs) > 0.05 && Math.abs(gainDb - prevGain) > 0.05) {
+        const slope = clamp((lufsNow - prevLufs) / (gainDb - prevGain), 0.5, 1.2);
+        next = gainDb + err / slope;
+      }
+      prevGain = gainDb; prevLufs = lufsNow;
+      gainDb = clamp(next, -20, 20);
+    }
+    if (best && best.left !== left) {   // the last pass was not the closest one
+      left = best.left; right = best.right; lufsNow = best.lufs; totalGainDb = best.gain; limiterGainReductionDb = best.gr;
     }
 
     // Report what was actually measured on the final signal, not the configured
     // target -- for low-crest material, hitting the LUFS target can legitimately
     // land the true peak well under the ceiling, and that's correct, not a bug.
-    const measuredTruePeakDb = measureTruePeak(left, right, sampleRate, 8);
+    const measuredTruePeakDb = measureTruePeak(left, right);
 
     return {
       left, right,
@@ -1501,7 +1673,7 @@
 
   function adaptToSource(sp, metrics, originalLufs, targetLUFS, ceilingDb, genreKey, isHotMaster, targetForced) {
     const report = [];
-    const out = { genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, airScale: 1, correction: null, subLiftDb: 0, targetLUFS: targetLUFS, report: report };
+    const out = { level: true, genBoost: 1, genLpHz: 17000, presenceScale: 1, lowScale: 1, airScale: 1, correction: null, subLiftDb: 0, targetLUFS: targetLUFS, report: report };
     const plr = metrics.peakDb - originalLufs;
     report.push({ key: 'loudness', label: 'Loudness', value: originalLufs.toFixed(1) + ' LUFS, peak ' + metrics.peakDb.toFixed(1) + ' dBFS, dynamics (PLR) ' + plr.toFixed(1) + ' dB' });
     if (sp) {
@@ -1515,6 +1687,7 @@
       const tb = thin * bright;
       if (sp.cutoffHz && sp.cutoffHz < 19000) {
         out.genLpHz = 19500;
+        out.genHpHz = Math.max(10000, sp.cutoffHz - 500);
         if (tb > 0.3) {                      // already bright: don't rebuild extra top
           report.push({ key: 'bandwidth', label: 'Top end', value: 'lossy cutoff at ' + (sp.cutoffHz / 1000).toFixed(1) + ' kHz', action: 'no extra air rebuild (source already bright)' });
         } else {
@@ -1537,9 +1710,12 @@
       // sits at 65-130 Hz but 30-55 Hz falls well below a pink-noise balance. Only when
       // the bass is actually there (bass above the body), so thin sources without a
       // bass line (the clean tape track, the thin + bright test) are left alone.
+      // Also only when the low end as a whole is light: a bass-heavy mix (hip-hop, EDM)
+      // with its weight at 60-130 Hz has plenty of lows and does not need a sub lift.
       const subShort = SUB_TARGET_DB - sp.subDb;
       const hasBass = clamp(sp.bassDb / 3, 0, 1);
-      const subLift = clamp(SUB_LIFT_PER_DB * (subShort - 1), 0, SUB_LIFT_MAX_DB) * hasBass;
+      const lightLows = clamp((8 - sp.lowDb) / 5, 0, 1);
+      const subLift = clamp(SUB_LIFT_PER_DB * (subShort - 1), 0, SUB_LIFT_MAX_DB) * hasBass * lightLows;
       if (subLift > 0.1) {
         out.subLiftDb = subLift;
         report.push({ key: 'sub', label: 'Deep lows 30-55 Hz', value: (sp.subDb >= 0 ? '+' : '') + sp.subDb.toFixed(1) + ' dB vs bass (missing)',
@@ -1703,7 +1879,7 @@
     }});
 
     steps.push({ pct: 20, run: function () {
-      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel, lowScale: adapt ? adapt.lowScale : 1 });
+      let r1 = trueIronStage(left, right, { sampleRate: sampleRate, strength: 5.14, mix: 0.20 * genre.trueIronMixMult * colourScale * (hasLevel ? LEVEL_IRON_MIX_BOOST : 1), transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel, lowBandOnly: hasLevel, lowScale: adapt ? adapt.lowScale : 1 });
       left = r1.left; right = r1.right;
     }});
 
@@ -1753,7 +1929,7 @@
     if (!isEDM && !isCharacterMode) {
       steps.push({ pct: 76, run: function () {
         let r4 = kazrogWarmthStage(left, right, { warmth: 0.25, wetDry: 0.445, warmthMult: genre.warmthMult * colourScale * (hasLevel ? LEVEL_WARMTH_BOOST : 1),
-          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel, lowScale: adapt ? adapt.lowScale : 1 });
+          sampleRate: sampleRate, transientGuard: hasLevel ? TRANSIENT_GUARD : 0, unityGain: hasLevel, levelDrive: hasLevel, bandLimited: hasLevel, lowScale: adapt ? adapt.lowScale : 1 });
         left = r4.left; right = r4.right;
         meta.kazrogMakeupGainDb = r4.makeupGainDb;
       }});
