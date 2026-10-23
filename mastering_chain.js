@@ -359,6 +359,9 @@
     universal: { label: 'Universal', stWidth: 1.05, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 45, transientAmount: 0.35, warmthMult: 1.0, airAmount: 0.45, mbBandGainDb: [0.5, 0.5, 0] },
     soulfunk: { label: 'Soul / Funk', colour: 0.85, stWidth: 1.30, trueIronMixMult: 1.13, enhancerMixMult: 1.15, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 40, transientAmount: 0.32, warmthMult: 1.15, airAmount: 0.62, mbBandGainDb: [1.0, 1.0, 0] },
     hiphop: { label: 'Rap / Hip-Hop', colour: 0.67, stWidth: 1.05, trueIronMixMult: 1.0, enhancerMixMult: 1.0, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 50, transientAmount: 0.40, warmthMult: 0.85, airAmount: 0.50, mbBandGainDb: [1.0, 0.5, 0] },
+    // Max: the Strong chain at full colour, with width, punch, density, tone and loudness
+    // set per track by maxPlan() from what the source lacks.
+    max: { label: 'Max', colour: 0.95, stWidth: 1.30, trueIronMixMult: 1.13, enhancerMixMult: 1.15, lowBandRatioMult: 1.0, lowBandThreshAdjustDb: 0, monoMkrHz: 40, transientAmount: 0.32, warmthMult: 1.15, airAmount: 0.62, mbBandGainDb: [0, 0, 0] },
     edm: { label: 'EDM / House / Trap', colour: 0.5, stWidth: 1.03, trueIronMixMult: 1.0, enhancerMixMult: 0.95, lowBandRatioMult: 1.3, lowBandThreshAdjustDb: -3, monoMkrHz: 70, transientAmount: 0.45, warmthMult: 1.0, airAmount: 0.60, mbBandGainDb: [0, 0, 0] },
     // Vinyl and Tape: character modes — minimal standard processing upstream, then the
     // dedicated stage takes over. Both normalise to a fixed -11 LUFS (same as soul/funk)
@@ -452,7 +455,12 @@
     soulfunk:   [ 11.2,  4.1,   0.2,  -3.2,  -5.5,  -6.8 ],
     hiphop:     [ 13.0,  2.4,   0.5,  -2.9,  -5.7,  -7.5 ],
     electronic: [ 13.3,  2.7,  -1.2,  -3.6,  -5.4,  -5.7 ],
+    // Max: the Acoustic-Live average with a little more weight at 120 Hz, slightly leaner
+    // low-mids and a brighter top -- full, open and clear.
+    max:        [ 12.2,  3.6,  -0.3,  -3.2,  -5.2,  -5.8 ],
   };
+  // Max corrects further toward its curve than the optional styles do.
+  const MAX_EQ = { strength: 0.6, capUp: 3.0, capDown: 2.5, deadband: 0.75 };
 
 
   // User-selectable tonal styles (independent of the processing level) and the
@@ -504,7 +512,11 @@
   // same biquad chain the static nudge uses. gainDb is already capped; direction and size
   // come from the measurement. Bands within DEADBAND_DB of the reference are left alone.
   const ADAPTIVE_DEADBAND_DB = 1.0; // don't fiddle with bands already close to target
-  function buildAdaptiveTonalMoves(genreKey, measuredBalanceDb) {
+  function buildAdaptiveTonalMoves(genreKey, measuredBalanceDb, opts) {
+    opts = opts || {};
+    const strength = opts.strength != null ? opts.strength : ADAPTIVE_STRENGTH;
+    const capUp = opts.capUp != null ? opts.capUp : ADAPTIVE_CAP_DB, capDown = opts.capDown != null ? opts.capDown : ADAPTIVE_CAP_DB;
+    const deadband = opts.deadband != null ? opts.deadband : ADAPTIVE_DEADBAND_DB;
     const ref = ADAPTIVE_REFERENCE[genreKey];
     if (!ref || !measuredBalanceDb) return null;
     // Center the reference on its own band-mean so it lives in the same "shape relative to
@@ -517,8 +529,8 @@
       const b = ADAPTIVE_BANDS[k];
       const refCentered = ref[k] - refMean;
       const deviation = refCentered - measuredBalanceDb[k]; // + => source too low, boost; - => too high, cut
-      if (Math.abs(deviation) <= ADAPTIVE_DEADBAND_DB) continue;
-      const gainDb = clamp(deviation * ADAPTIVE_STRENGTH, -ADAPTIVE_CAP_DB, ADAPTIVE_CAP_DB);
+      if (Math.abs(deviation) <= deadband) continue;
+      const gainDb = clamp(deviation * strength, -capDown, capUp);
       moves.push({ type: b.type, freq: b.freq, Q: b.Q, gainDb: gainDb });
     }
     return moves;
@@ -526,11 +538,12 @@
 
   // Apply a set of measured tonal moves (same biquad-chain shape as the static nudge).
   // The scale argument gates the amount so already-dense sources are corrected more gently.
-  function adaptiveTonalStage(left, right, sampleRate, moves, intensityScale) {
+  function adaptiveTonalStage(left, right, sampleRate, moves, intensityScale, cap) {
     const scale = intensityScale != null ? intensityScale : 1.0;
+    const c = cap != null ? cap : ADAPTIVE_CAP_DB;
     if (!moves || !moves.length || scale <= 0.02) return { left, right, applied: [] };
     const applied = moves.map(function (m) {
-      return { type: m.type, freq: m.freq, Q: m.Q, gainDb: clamp(m.gainDb * scale, -ADAPTIVE_CAP_DB, ADAPTIVE_CAP_DB) };
+      return { type: m.type, freq: m.freq, Q: m.Q, gainDb: clamp(m.gainDb * scale, -c, c) };
     }).filter(function (m) { return Math.abs(m.gainDb) > 0.01; });
     if (!applied.length) return { left, right, applied: [] };
     const chainL = applied.map(m => makeBiquad(m.type, m.freq, sampleRate, m.Q, m.gainDb));
@@ -690,7 +703,9 @@
     // with a 6 ms release rides every half-cycle of a sustained bass note, so the gain
     // wobbled at twice the note's frequency (~1.5% distortion on a plain 40 Hz tone);
     // attacks still stand out clearly in the band above the bass.
-    const hpL = makeBiquad('highpass', 150, sampleRate, 0.707), hpR = makeBiquad('highpass', 150, sampleRate, 0.707);
+    // 4th-order detector high-pass, and the first 1 dB of fast-over-slow is ignored: a
+    // steady sound ripples the fast envelope a little and must not be modulated by it.
+    const hpL = makeCrossoverHP(150, sampleRate), hpR = makeCrossoverHP(150, sampleRate);
     const fc = 1 - Math.exp(-1 / (sampleRate * 0.002)), sc = 1 - Math.exp(-1 / (sampleRate * 0.04));
     const gc = 1 - Math.exp(-1 / (sampleRate * 0.001));
     let fp = 0, sp = 0, gDb = 0;
@@ -700,7 +715,7 @@
       const pw = Math.max(a * a, b * b);
       fp += (pw - fp) * fc; sp += (pw - sp) * sc;
       const diffDb = 10 * Math.log10((fp + 1e-12) / (sp + 1e-12));
-      const target = diffDb > 0 ? Math.min(diffDb, 4) * amount : 0;
+      const target = diffDb > 1 ? Math.min(diffDb - 1, 4) * amount : 0;
       gDb += (target - gDb) * gc;
       const g = dbToLin(gDb);
       left[i] *= g; right[i] *= g;
@@ -1675,7 +1690,7 @@
   // Peak-reduction budget (dB) per processing level: how much the clipper + limiter may
   // shave off a very dynamic source to reach the loudness target. Beyond it the target is
   // lowered instead (never below the source's own loudness) so the hits keep their punch.
-  const DYNAMICS_BUDGET_DB = { soulfunk: 6, hiphop: 5, edm: 4 };
+  const DYNAMICS_BUDGET_DB = { max: 7, soulfunk: 6, hiphop: 5, edm: 4 };
   const DYNAMICS_REF_CEILING_DB = -0.3;
 
   // Turn the measured source features into parameter changes for the processing levels,
@@ -1762,11 +1777,103 @@
     return out;
   }
 
+  // ---------------- Max: per-track plan ----------------
+  // Max reads what the source lacks and sets each move from that, as far as it can go
+  // cleanly: width toward a typical wide mix (never past MAX_SIDE_MID_DB), transient
+  // emphasis that grows as the source gets more squashed, parallel compression (density)
+  // that grows as the source gets more dynamic, and tone pulled toward the Max curve with
+  // larger caps than the styles. Loudness -10 LUFS at -1 dBTP.
+  const MAX_WIDTH_TARGET_DB = -6, MAX_WIDTH_GAIN = 1.8;
+  const MAX_SPREAD_BELOW_DB = -14, MAX_SPREAD_GAIN = 0.22;
+  function maxPlan(metrics, originalLufs, sideMidDb, balance) {
+    const plr = metrics.peakDb - originalLufs;
+    const plan = { report: [] };
+    plan.stWidth = clamp(dbToLin(MAX_WIDTH_TARGET_DB - sideMidDb), 1.05, MAX_WIDTH_GAIN);
+    plan.spread = sideMidDb < MAX_SPREAD_BELOW_DB ? MAX_SPREAD_GAIN * clamp((MAX_SPREAD_BELOW_DB - sideMidDb) / 6, 0, 1) : 0;
+    plan.transientAmount = clamp(0.3 + (16 - plr) * 0.05, 0.3, 0.6);
+    plan.densityMix = 0.35 * clamp((plr - 10) / 8, 0, 1);
+    plan.eqMoves = balance ? (buildAdaptiveTonalMoves('max', balance, MAX_EQ) || []) : [];
+    const f1 = (v) => (v >= 0 ? '+' : '') + v.toFixed(1);
+    const w = sideMidDb < -12 ? 'narrow' : (sideMidDb < -7 ? 'medium' : 'wide');
+    plan.report.push({ key: 'maxwidth', label: 'Width', value: 'side ' + f1(sideMidDb) + ' dB vs mid (' + w + ')',
+      action: 'side +' + Math.round((plan.stWidth - 1) * 100) + '%' + (plan.spread > 0 ? ', plus stereo spread (mono-safe)' : '') });
+    plan.report.push({ key: 'maxpunch', label: 'Punch', value: 'peak-to-loudness ' + plr.toFixed(1) + ' dB' + (plr < 11 ? ' (squashed)' : ''),
+      action: 'transients up to +' + (4 * plan.transientAmount).toFixed(1) + ' dB on attacks' });
+    plan.report.push({ key: 'maxdensity', label: 'Density', value: plr > 12 ? 'open, dynamic' : 'already dense',
+      action: plan.densityMix > 0.02 ? 'parallel compression ' + Math.round(plan.densityMix * 100) + '%' : 'none needed' });
+    plan.report.push(maxToneReport(plan.eqMoves));
+    return plan;
+  }
+  // The 120 Hz shelf also lifts the sub, so on Max it gives way to a deep-lows lift made
+  // up front (adaptToSource) instead of stacking on top of it.
+  function capMaxLows(moves, subLiftDb) {
+    if (!moves || !(subLiftDb > 0)) return moves;
+    return moves.map(function (m) {
+      return (m.freq === 120 && m.gainDb > 0) ? { type: m.type, freq: m.freq, Q: m.Q, gainDb: Math.min(m.gainDb, Math.max(0, MAX_EQ.capUp - 0.6 * subLiftDb)) } : m;
+    });
+  }
+  function maxToneReport(eqMoves) {
+    const names = { 120: 'lows', 350: 'low-mids', 700: 'mids', 1800: 'upper mids', 4000: 'presence', 9000: 'air' };
+    const f1 = (v) => (v >= 0 ? '+' : '') + v.toFixed(1);
+    const moves = (eqMoves || []).filter(function (m) { return Math.abs(m.gainDb) >= 0.5; });
+    return { key: 'maxtone', label: 'Tone', value: moves.length ? 'off the Max curve in ' + moves.length + ' band' + (moves.length > 1 ? 's' : '') : 'already close to the Max curve',
+      action: moves.length ? 'about ' + moves.map(function (m) { return names[m.freq] + ' ' + f1(m.gainDb) + ' dB'; }).join(', ') : null };
+  }
+
+  // Max: mono-safe stereo spread for near-mono sources. A decorrelated copy of the mid
+  // (300 Hz - 12 kHz through an allpass chain) is added as side: L = M + S, R = M - S, so
+  // the mono sum is exactly the original mid.
+  function stereoSpreadStage(left, right, sampleRate, amount) {
+    if (!(amount > 0)) return { left, right };
+    const hp = makeBiquad('highpass', 300, sampleRate, 0.707), lp = makeBiquad('lowpass', 12000, sampleRate, 0.707);
+    const ap = [];
+    [[620, 0.8], [1900, 0.7], [5200, 0.7]].forEach(function (f) {
+      const w0 = 2 * Math.PI * f[0] / sampleRate, al = Math.sin(w0) / (2 * f[1]), cw = Math.cos(w0), a0 = 1 + al;
+      ap.push(makeRawBiquad((1 - al) / a0, -2 * cw / a0, 1, -2 * cw / a0, (1 - al) / a0));
+    });
+    for (let i = 0; i < left.length; i++) {
+      let sd = lp(hp((left[i] + right[i]) * 0.5));
+      for (let k = 0; k < ap.length; k++) sd = ap[k](sd);
+      sd *= amount;
+      left[i] += sd; right[i] -= sd;
+    }
+    return { left, right };
+  }
+
+  // Max: parallel ("New York") compression. A heavily compressed copy (4:1, threshold
+  // 6 dB under the programme RMS) is mixed under the untouched signal: quiet detail and
+  // sustain come up, the attacks of the dry signal stay intact. The detector follows
+  // power (20 ms attack / 150 ms release) and the gain is smoothed over 20 ms: a peak
+  // follower rides the waveform of the bass and modulates everything above it.
+  function parallelCompStage(left, right, sampleRate, mix) {
+    if (!(mix > 0.01)) return { left, right };
+    const n = left.length;
+    let ss = 0; for (let i = 0; i < n; i++) ss += left[i] * left[i] + right[i] * right[i];
+    const rmsDb = 10 * Math.log10(ss / Math.max(1, 2 * n) + 1e-12);
+    const thr = rmsDb - 6, ratio = 4;
+    const ac = 1 - Math.exp(-1 / (sampleRate * 0.02)), rc = 1 - Math.exp(-1 / (sampleRate * 0.15));
+    const gs = 1 - Math.exp(-1 / (sampleRate * 0.02));
+    const gain = new Float32Array(n);
+    let g = 0, cs = 0, pw = 0;
+    for (let i = 0; i < n; i++) {
+      const x2 = 0.5 * (left[i] * left[i] + right[i] * right[i]);
+      pw += (x2 - pw) * (x2 > pw ? ac : rc);
+      const e = 10 * Math.log10(2 * pw + 1e-12);   // ~peak level of a sine at the same power
+      const target = e > thr ? -(e - thr) * (1 - 1 / ratio) : 0;
+      g += (target - g) * gs; gain[i] = dbToLin(g);
+      cs += (left[i] * left[i] + right[i] * right[i]) * gain[i] * gain[i];
+    }
+    const makeup = Math.sqrt(ss / Math.max(cs, 1e-12));
+    for (let i = 0; i < n; i++) { const w = 1 + mix * gain[i] * makeup; left[i] *= w; right[i] *= w; }
+    return { left, right };
+  }
+
   function buildPipeline(leftIn, rightIn, sampleRate, options, precomputed) {
     options = options || {};
     const genreKey = options.genre || 'universal';
     const genre = getGenreProfile(genreKey);
     const isEDM = genreKey === 'edm';
+    const isMax = genreKey === 'max';
     const isVinyl = genreKey === 'vinyl';
     const isTape = genreKey === 'tape';
     const isCharacterMode = isVinyl || isTape; // vinyl/tape: minimal standard chain, then character stage
@@ -1782,9 +1889,12 @@
     // behaviour applies (soulfunk/hiphop reference, static nudge otherwise).
     const styleChosen = Object.prototype.hasOwnProperty.call(options, 'tonalStyle');
     const tonalStyle = styleChosen && TONAL_STYLES[options.tonalStyle] ? options.tonalStyle : null;
-    const adaptiveRefKey = styleChosen
-      ? (tonalStyle ? TONAL_STYLES[tonalStyle].reference : null)
-      : (ADAPTIVE_REFERENCE[genreKey] ? genreKey : null);
+    // Max always corrects tone: toward the chosen style's curve, or its own one.
+    const adaptiveRefKey = genreKey === 'max'
+      ? (tonalStyle ? TONAL_STYLES[tonalStyle].reference : 'max')
+      : styleChosen
+        ? (tonalStyle ? TONAL_STYLES[tonalStyle].reference : null)
+        : (ADAPTIVE_REFERENCE[genreKey] ? genreKey : null);
     // The band balance is measured right before the tonal stage (not on the untouched
     // input): the multiband, enhancer and air stages already add ~+1 dB around 2 kHz, so
     // a correction computed from the raw source under-cuts a band that pokes out.
@@ -1801,7 +1911,8 @@
     const effectKey = hasLevel && (options.effect === 'tape' || options.effect === 'vinyl') ? options.effect : null;
     const colourScale = hasLevel ? genre.colour * (0.6 + 0.4 * intensityScale) : intensityScale;
     const sourceSideMidDb = hasLevel ? measureSideMidDb(left, right, sampleRate) : null;
-    const stWidth = hasLevel ? widthForSource(genre.stWidth, sourceSideMidDb) : genre.stWidth;
+    const plan = isMax ? maxPlan(metrics, originalLufs, sourceSideMidDb, measureBandBalance(left, right, sampleRate)) : null;
+    const stWidth = hasLevel ? widthForSource(plan ? plan.stWidth : genre.stWidth, sourceSideMidDb) : genre.stWidth;
     const headroomTargetDb = -2.0 - density * 1.0;
 
     // "already loud/wide" detection for EDM: a finished, hot master (near/above 0 dBFS,
@@ -1843,7 +1954,7 @@
     // read as less clear. The output is always driven fully to these unless the source
     // is already louder. Medium (hip-hop) was taken down by ~1 dB across the board
     // (loudness -12 -> -13, colour -1 dB, side gain -1 dB) after it read as too loud.
-    const genreTargetLUFS = { soulfunk: -11.5, universal: -12, hiphop: -13, vinyl: -11, tape: -11 };
+    const genreTargetLUFS = { max: -10, soulfunk: -11.5, universal: -12, hiphop: -13, vinyl: -11, tape: -11 };
     let targetLUFS = options.targetLUFS != null ? options.targetLUFS
                        : (isEDM ? edmTarget : (genreTargetLUFS[genreKey] != null ? genreTargetLUFS[genreKey] : -12));
     // True-peak ceiling: -1.0 dBTP everywhere (Oct 2026, the user's choice): headroom for
@@ -1853,6 +1964,11 @@
     // Adaptation to the measured source (processing levels only; see adaptToSource).
     const adapt = hasLevel ? adaptToSource(spectrum, metrics, originalLufs, targetLUFS, targetTruePeakDb, genreKey, isHotMaster, options.targetLUFS != null) : null;
     if (adapt) { targetLUFS = adapt.targetLUFS; meta.sourceAnalysis = adapt.report; }
+    if (plan && adapt && adapt.subLiftDb > 0) {
+      plan.eqMoves = capMaxLows(plan.eqMoves, adapt.subLiftDb);
+      plan.report = plan.report.map(function (it) { return it.key === 'maxtone' ? maxToneReport(plan.eqMoves) : it; });
+    }
+    if (plan) { meta.sourceAnalysis = (meta.sourceAnalysis || []).concat(plan.report); meta.maxPlan = { stWidth: stWidth, spread: plan.spread, transientAmount: plan.transientAmount, densityMix: plan.densityMix }; }
     meta.plannedTargetLUFS = targetLUFS; meta.plannedCeilingDb = targetTruePeakDb;
     meta.sourcePeakDb = metrics.peakDb;
 
@@ -1899,7 +2015,7 @@
 
     // EDM: minimal-to-no transient emphasis (reference preserves the source's envelope).
     steps.push({ pct: 32, run: function () {
-      const tAmt = (isEDM ? 0.15 : 1.0) * genre.transientAmount * intensityScale;
+      const tAmt = plan ? plan.transientAmount : (isEDM ? 0.15 : 1.0) * genre.transientAmount * intensityScale;
       let rt = transientEmphasisStage(left, right, sampleRate, tAmt);
       left = rt.left; right = rt.right;
     }});
@@ -1915,6 +2031,14 @@
       });
       left = r2.left; right = r2.right;
     }});
+
+    if (plan && (plan.spread > 0 || plan.densityMix > 0.01)) {
+      steps.push({ pct: 50, run: function () {
+        let rs = stereoSpreadStage(left, right, sampleRate, plan.spread);
+        rs = parallelCompStage(rs.left, rs.right, sampleRate, plan.densityMix);
+        left = rs.left; right = rs.right;
+      }});
+    }
 
     // multiband: FULL chain only. EDM and character modes skip it.
     if (!isEDM && !isCharacterMode) {
@@ -1974,10 +2098,12 @@
       steps.push({ pct: 85, run: function () {
         if (hasAdaptiveReference) {
           const balance = measureBandBalance(left, right, sampleRate);
-          const moves = buildAdaptiveTonalMoves(adaptiveRefKey, balance);
+          let moves = buildAdaptiveTonalMoves(adaptiveRefKey, balance, isMax ? MAX_EQ : null);
+          if (isMax && adapt) moves = capMaxLows(moves, adapt.subLiftDb);
           // Corrective EQ is gated more gently than the colour stages: a dense, loud source
           // with a harsh band still needs most of the cut (same gate as the air exciter).
-          let rn = adaptiveTonalStage(left, right, sampleRate, moves, 0.5 + 0.5 * intensityScale);
+          let rn = isMax ? adaptiveTonalStage(left, right, sampleRate, moves, 0.75 + 0.25 * intensityScale, MAX_EQ.capUp)
+                         : adaptiveTonalStage(left, right, sampleRate, moves, 0.5 + 0.5 * intensityScale);
           left = rn.left; right = rn.right;
           meta.tonalBalanceMeasuredDb = balance;
           meta.adaptiveTonalMoves = rn.applied;
